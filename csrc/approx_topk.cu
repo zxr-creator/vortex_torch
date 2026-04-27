@@ -31,21 +31,33 @@
 namespace {
 
 // =====================================================================
-// Inlined SELECT32-SORT32 small-K fast path (bf16, K<=32, pages<=8192).
+// Inlined SELECT32-SORT32 small-K fast path (bf16, K<=32, pages<=16384).
 // Port of TopK30_RandomSplit_Select32_Kernel from
 // csrc/topk_sglang_merge.cu (vendored from main vortex_torch repo) with
 // SPLITS=1, MAPPING_NONE, PART_CONTIGUOUS — no split, no merge, no
-// workspace, no done_counter, no remap. Algorithm:
-//   Pass 1   — top-byte (key>>24) histogram over the row
-//   Pass 2   — gather strict-above-threshold-bin items into s_top_keys/idx,
-//              build byte-1 sub-histogram on threshold-bin items
-//   Pass 3   — gather sub-strict, then sub-at items in arrival order
-//   Stage D  — cub::WarpMergeSort over the 32 candidates
-//   Direct write of top-(topk_val) to output.
-// NUM_THREADS=1024 mirrors kSelCfg1 from the upstream — the bench sweep
-// confirmed this is the right launch shape (smaller NT collapses the win).
+// workspace, no done_counter, no remap.
 //
-// Routing decision lives in approx_topk_output below.
+// Long-L optimizations on top of the upstream port:
+//  1. `s_bins` dynamic-SMEM cache. Pass 1 records (key>>24) per element
+//     so Pass 2 can short-circuit the dominant `bin < threshold_bin`
+//     branch with a SMEM byte read instead of a global score reload.
+//     16 KB per CTA at the L=16384 cap.
+//  2. Pass 2 also pushes threshold-bin elements (local_rank) into a
+//     small `s_cand_idx` list (CAND_MAX=512 → 2 KB). Pass 3 then
+//     iterates only that list (~L/256 entries for random scores)
+//     instead of scanning all L. If the cap overflows on a
+//     concentrated distribution, Pass 3 falls back to scanning all L
+//     with the s_bins gate (correctness preserved).
+//  3. Single-warp __shfl-based reverse-cumsum replacing the original
+//     8-step strided Hillis-Steele scan. Cuts 8 __syncthreads per
+//     cumsum × 2 cumsums = 16 barriers (~2 µs at NT=1024). This is
+//     the optimization that extends the sweet spot from L=4K to
+//     L=16K — at long L the original cumsum's barrier cost was the
+//     dominant fixed overhead per kernel invocation.
+//
+// NUM_THREADS=1024 mirrors kSelCfg1 from the upstream — bench sweep
+// confirmed smaller NT collapses the speedup. Routing decision lives
+// in approx_topk_output below.
 // =====================================================================
 
 namespace approx_topk_select32 {
@@ -75,6 +87,11 @@ void Kernel(
 {
     constexpr int LOCAL_K = 32;
     constexpr int kRadix  = 256;
+    // Max threshold-bin candidates we record in Pass 2 to feed Pass 3.
+    // For random L=16K, expected count is ~L/256 = 64; 512 gives ~8x
+    // headroom. If exceeded (concentrated distribution), Pass 3 falls
+    // back to scanning all L with the s_bins gate.
+    constexpr int CAND_MAX = 512;
 
     alignas(128) __shared__ int s_hist_buf[2][kRadix + 128];
     __shared__ int      s_above_count;
@@ -85,11 +102,17 @@ void Kernel(
     __shared__ int      s_sub_threshold_bin;
     __shared__ int      s_sub_last_remain;
     __shared__ int      s_strictly_above_sub;
+    __shared__ int      s_cand_count;
     __shared__ uint32_t s_top_keys[LOCAL_K];
     __shared__ int32_t  s_top_idx [LOCAL_K];
+    __shared__ int32_t  s_cand_idx[CAND_MAX];
 
     using LocalSortT = cub::WarpMergeSort<uint32_t, 1, 32, int32_t>;
     __shared__ typename LocalSortT::TempStorage local_sort_smem;
+
+    // Dynamic SMEM cache: s_bins[i] = (key_i >> 24) for i in [0, row_len).
+    // Sized to max_num_pages from the host launch.
+    extern __shared__ uint8_t s_bins[];
 
     const int b  = blockIdx.x;
     const int tx = threadIdx.x;
@@ -111,6 +134,7 @@ void Kernel(
         s_above_count = 0; s_thresh_above_count = 0; s_thresh_at_count = 0;
         s_threshold_bin = -1; s_last_remain = 0;
         s_sub_threshold_bin = -1; s_sub_last_remain = 0; s_strictly_above_sub = 0;
+        s_cand_count = 0;
     }
     if (tx < LOCAL_K) { s_top_keys[tx] = 0u; s_top_idx[tx] = -1; }
     __syncthreads();
@@ -120,25 +144,47 @@ void Kernel(
         return;
     }
 
+    // Reverse-inclusive cumsum over s_hist_buf[0][0..kRadix). Result lands
+    // back in s_hist_buf[0]. The previous strided implementation needed 8
+    // __syncthreads barriers per call (~1.2 µs at NT=1024); this version
+    // does the entire 256-bin scan inside a single warp using __shfl,
+    // costing one trailing __syncthreads to broadcast.
     auto run_cumsum_strided = [&]() {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int j = 1 << i;
-            const int k = i & 1;
-            for (int idx = tx; idx < kRadix; idx += NUM_THREADS) {
-                int v = s_hist_buf[k][idx];
-                if (idx + j < kRadix) v += s_hist_buf[k][idx + j];
-                s_hist_buf[k ^ 1][idx] = v;
+        if (tx < 32) {
+            constexpr int kPerLane = kRadix / 32;  // 8
+            int locals[kPerLane];
+            #pragma unroll
+            for (int j = 0; j < kPerLane; ++j) {
+                locals[j] = s_hist_buf[0][tx * kPerLane + j];
             }
-            __syncthreads();
+            #pragma unroll
+            for (int j = kPerLane - 2; j >= 0; --j) {
+                locals[j] += locals[j + 1];
+            }
+            int my_sum = locals[0];
+            #pragma unroll
+            for (int delta = 1; delta < 32; delta *= 2) {
+                const int v = __shfl_down_sync(0xFFFFFFFF, my_sum, delta);
+                if (tx + delta < 32) {
+                    my_sum += v;
+                }
+            }
+            const int suffix = my_sum - locals[0];
+            #pragma unroll
+            for (int j = 0; j < kPerLane; ++j) {
+                s_hist_buf[0][tx * kPerLane + j] = locals[j] + suffix;
+            }
         }
+        __syncthreads();
     };
 
-    // Pass 1
+    // Pass 1 — byte-0 hist + write s_bins cache.
     for (int local_rank = tx; local_rank < row_len; local_rank += NUM_THREADS) {
         const float    raw = __bfloat162float(row_scores[local_rank]);
         const uint32_t key = score_to_key32_bf16(raw);
-        ::atomicAdd(&s_hist_buf[0][static_cast<int>(key >> 24)], 1);
+        const int      bin = static_cast<int>(key >> 24);
+        s_bins[local_rank] = static_cast<uint8_t>(bin);
+        ::atomicAdd(&s_hist_buf[0][bin], 1);
     }
     __syncthreads();
     run_cumsum_strided();
@@ -173,19 +219,27 @@ void Kernel(
         }
         __syncthreads();
 
-        // Pass 2
+        // Pass 2 — cached-bin short-circuits the dominant `< threshold_bin`
+        // branch. For threshold-bin elements, also push the local_rank into
+        // s_cand_idx[] so Pass 3 only iterates the candidate list (not all L).
         for (int local_rank = tx; local_rank < row_len; local_rank += NUM_THREADS) {
+            const int cached_bin = static_cast<int>(s_bins[local_rank]);
+            if (cached_bin < threshold_bin) continue;
             const float    raw = __bfloat162float(row_scores[local_rank]);
             const uint32_t key = score_to_key32_bf16(raw);
-            const int      bin = static_cast<int>(key >> 24);
-            if (bin > threshold_bin) {
+            if (cached_bin > threshold_bin) {
                 const int slot = ::atomicAdd(&s_above_count, 1);
                 if (slot < LOCAL_K) {
                     s_top_keys[slot] = key;
                     s_top_idx [slot] = row_idxmap[local_rank];
                 }
-            } else if (bin == threshold_bin) {
+            } else {  // cached_bin == threshold_bin
+                // Always update sub-hist (correct sub_threshold_bin even on overflow).
                 ::atomicAdd(&s_hist_buf[0][static_cast<int>((key >> 16) & 0xFF)], 1);
+                const int cslot = ::atomicAdd(&s_cand_count, 1);
+                if (cslot < CAND_MAX) {
+                    s_cand_idx[cslot] = local_rank;
+                }
             }
         }
         __syncthreads();
@@ -208,12 +262,42 @@ void Kernel(
         const int strictly_above_sub_bn = s_strictly_above_sub;
         const int above_base            = s_above_count;
 
-        // Pass 3
-        for (int local_rank = tx; local_rank < row_len; local_rank += NUM_THREADS) {
-            const float    raw = __bfloat162float(row_scores[local_rank]);
-            const uint32_t key = score_to_key32_bf16(raw);
-            const int      bin = static_cast<int>(key >> 24);
-            if (bin == threshold_bin) {
+        // Pass 3 — fast path iterates only the candidate list (~L/256 entries
+        // for random scores). If the cap was exceeded, fall back to scanning
+        // all L with the s_bins gate so correctness is preserved for any
+        // distribution.
+        const int total_cand = s_cand_count;
+        if (total_cand <= CAND_MAX) {
+            for (int i = tx; i < total_cand; i += NUM_THREADS) {
+                const int local_rank = s_cand_idx[i];
+                const float    raw = __bfloat162float(row_scores[local_rank]);
+                const uint32_t key = score_to_key32_bf16(raw);
+                const int sub_bin = static_cast<int>((key >> 16) & 0xFF);
+                if (sub_bin > sub_threshold_bin) {
+                    const int rel  = ::atomicAdd(&s_thresh_above_count, 1);
+                    const int slot = above_base + rel;
+                    if (slot < LOCAL_K) {
+                        s_top_keys[slot] = key;
+                        s_top_idx [slot] = row_idxmap[local_rank];
+                    }
+                } else if (sub_bin == sub_threshold_bin) {
+                    const int rel = ::atomicAdd(&s_thresh_at_count, 1);
+                    if (rel < sub_last_remain) {
+                        const int slot = above_base + strictly_above_sub_bn + rel;
+                        if (slot < LOCAL_K) {
+                            s_top_keys[slot] = key;
+                            s_top_idx [slot] = row_idxmap[local_rank];
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback for pathological concentrated distributions.
+            for (int local_rank = tx; local_rank < row_len; local_rank += NUM_THREADS) {
+                const int cached_bin = static_cast<int>(s_bins[local_rank]);
+                if (cached_bin != threshold_bin) continue;
+                const float    raw = __bfloat162float(row_scores[local_rank]);
+                const uint32_t key = score_to_key32_bf16(raw);
                 const int sub_bin = static_cast<int>((key >> 16) & 0xFF);
                 if (sub_bin > sub_threshold_bin) {
                     const int rel  = ::atomicAdd(&s_thresh_above_count, 1);
@@ -482,8 +566,13 @@ void approx_topk_output(
         if (inferred_k >= 16 && inferred_k <= 32) {
             // NUM_THREADS=1024 mirrors kSelCfg1 from topk_sglang_merge.cu —
             // benchmark showed smaller NT collapses the speedup.
+            // Dynamic SMEM holds s_bins (one byte per row element). Aligning
+            // to 16 keeps the byte block well-aligned; 16 KB at the cap is
+            // comfortably under the 48 KB default per-CTA ceiling.
+            const size_t bins_bytes =
+                (static_cast<size_t>(max_num_pages) + size_t(15)) & ~size_t(15);
             approx_topk_select32::Kernel<1024>
-                <<<dim3(eff_batch_size), dim3(1024), 0, stream>>>(
+                <<<dim3(eff_batch_size), dim3(1024), bins_bytes, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
                     dense_kv_indptr.data_ptr<int>(),
                     sparse_kv_indptr.data_ptr<int>(),
