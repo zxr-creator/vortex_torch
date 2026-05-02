@@ -107,7 +107,30 @@ def main() -> None:
     parser.add_argument("--with-stack", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
 
-    parser.add_argument("--vortex-algorithm", default="BLOCK_TOPK") 
+    parser.add_argument("--vortex-algorithm", default="BLOCK_TOPK")
+    parser.add_argument(
+        "--enable-vortex-sparsity",
+        dest="enable_vortex_sparsity_flag",
+        action="store_true",
+        default=True,
+        help="Enable VTXGraphAttnBackend / VTXGraphCachePool (default: True).",
+    )
+    parser.add_argument(
+        "--disable-vortex-sparsity",
+        dest="enable_vortex_sparsity_flag",
+        action="store_false",
+        help="Force full FlashInfer attention (debug only).",
+    )
+    parser.add_argument(
+        "--profile-prefill",
+        action="store_true",
+        help="Move cudaProfilerStart() before prefill so cache-construction kernels are captured.",
+    )
+    parser.add_argument(
+        "--vortex-topk-val",
+        type=int,
+        default=29,
+    )
 
     args = parser.parse_args()
     # Backfill any ServerArgs fields that are not exposed by add_cli_args in this build.
@@ -124,23 +147,20 @@ def main() -> None:
 
     # Force VTX FlashInfer backend
     server_args.attention_backend = "flashinfer"
-    server_args.enable_vortex_sparsity = False
+    server_args.enable_vortex_sparsity = bool(args.enable_vortex_sparsity_flag)
     server_args.disable_overlap_schedule = True
     server_args.disable_cuda_graph = False
-    server_args.vortex_module_name = "block_sparse_attention" 
-    server_args.vortex_topk_val = 29
-    server_args.vortex_layers_skip = [0] 
+    server_args.vortex_module_name = "block_sparse_attention"
+    server_args.vortex_topk_val = args.vortex_topk_val
+    server_args.vortex_layers_skip = [0]
     server_args.page_size = 512
-    server_args.block_size = 16
+    server_args.vortex_block_size = 16
     server_args.vortex_block_reserved_bos = 1
     server_args.vortex_block_reserved_eos = 2
     server_args.vortex_workload_chunk_size = 32
-    server_args.vortex_compilation_cache_dir="./vortex_compilation_cache"
+    server_args.vortex_compilation_cache_dir = "./vortex_compilation_cache"
     server_args.vortex_max_seq_lens = 65536
     server_args.mem_fraction_static = 0.85
-    server_args.model_path = "Qwen/Qwen3-1.7B"
-    # if getattr(args, "disable_cuda_graph", False): 
-        # server_args.disable_cuda_graph = True 
 
     if server_args.tp_size != 1:
         raise ValueError("This script supports tp_size=1 only. Use tp_size=1 for profiling.")
@@ -188,10 +208,14 @@ def main() -> None:
     )
 
     with torch.no_grad():
+        if args.profile_prefill and server_args.device == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+
         # Prefill (extend) one request at a time to avoid the OOM caused by
-        # prefilling the whole batch in a single forward pass. We only profile
-        # the decode phase, so per-request prefill is functionally equivalent
-        # — we just merge the resulting per-request batches afterwards.
+        # prefilling the whole batch in a single forward pass. When
+        # --profile-prefill is set, the cudaProfilerStart() above lets nsys
+        # capture cache-construction kernels that only fire during prefill.
         per_req_next_ids = []
         batch = None
         for i, req in enumerate(reqs):
@@ -216,8 +240,9 @@ def main() -> None:
         if server_args.device == "cuda":
             torch.cuda.synchronize()
 
-        # Optional: tell nsys to only start collecting here
-        if server_args.device == "cuda":
+        # If we did not already start the profiler before prefill, start it now
+        # so nsys captures only the decode loop.
+        if not args.profile_prefill and server_args.device == "cuda":
             torch.cuda.cudart().cudaProfilerStart()
 
         with torch.cuda.nvtx.range("decode_loop"):

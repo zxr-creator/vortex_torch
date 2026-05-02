@@ -9,6 +9,21 @@ PYTHON_SCRIPT=${PYTHON_SCRIPT:-profile_decode.py}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-64}
 OUT_DIR=${OUT_DIR:-nsys_decode_reports}
 RUN_TAG=${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}
+# Set ENABLE_VORTEX=0 to profile plain FlashInfer (debug only).
+ENABLE_VORTEX=${ENABLE_VORTEX:-1}
+# Set PROFILE_PREFILL=1 to also capture prefill-time cache-construction kernels.
+PROFILE_PREFILL=${PROFILE_PREFILL:-0}
+VORTEX_TOPK_VAL=${VORTEX_TOPK_VAL:-29}
+
+vortex_flag="--enable-vortex-sparsity"
+if [[ "${ENABLE_VORTEX}" == "0" ]]; then
+  vortex_flag="--disable-vortex-sparsity"
+fi
+
+prefill_flag=()
+if [[ "${PROFILE_PREFILL}" == "1" ]]; then
+  prefill_flag=(--profile-prefill)
+fi
 
 # Test matrix
 MODEL_PATHS=(Qwen/Qwen3-0.6B Qwen/Qwen3-1.7B Qwen/Qwen3-4B Qwen/Qwen3-8B)
@@ -77,6 +92,9 @@ for midx in "${!MODEL_PATHS[@]}"; do
           --batch-size "${bs}" \
           --max-new-tokens "${MAX_NEW_TOKENS}" \
           --input-len "${input_len}" \
+          --vortex-topk-val "${VORTEX_TOPK_VAL}" \
+          "${vortex_flag}" \
+          "${prefill_flag[@]}" \
         > "${log_file}" 2>&1
 
       status=$?
