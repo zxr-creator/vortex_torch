@@ -136,7 +136,7 @@ def main() -> None:
     server_args.vortex_block_reserved_eos = 2
     server_args.vortex_workload_chunk_size = 32
     server_args.vortex_compilation_cache_dir="./vortex_compilation_cache"
-    server_args.vortex_max_seq_lens = 20480
+    server_args.vortex_max_seq_lens = 65536
     server_args.mem_fraction_static = 0.85
     server_args.model_path = "Qwen/Qwen3-1.7B"
     # if getattr(args, "disable_cuda_graph", False): 
@@ -188,11 +188,28 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        # Prefill (extend) without profiling
-        next_token_ids, _, batch = extend(reqs, model_runner)
+        # Prefill (extend) one request at a time to avoid the OOM caused by
+        # prefilling the whole batch in a single forward pass. We only profile
+        # the decode phase, so per-request prefill is functionally equivalent
+        # — we just merge the resulting per-request batches afterwards.
+        per_req_next_ids = []
+        batch = None
+        for i, req in enumerate(reqs):
+            with torch.cuda.nvtx.range(f"prefill_req_{i}"):
+                nti_i, _, batch_i = extend([req], model_runner)
+            per_req_next_ids.append(nti_i)
+            if batch is None:
+                batch = batch_i
+            else:
+                batch.merge_batch(batch_i)
+            if server_args.device == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+        next_token_ids = torch.cat(per_req_next_ids, dim=0)
 
         if server_args.device == "cuda":
-            torch.cuda.synchronize() 
+            torch.cuda.synchronize()
 
         decode_steps = max(args.max_new_tokens - 1, 0)
 

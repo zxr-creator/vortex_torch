@@ -11,4 +11,4 @@ nsys profile \
     --model-path Qwen/Qwen3-1.7B \
     --batch-size 4 \
     --max-new-tokens 64 \
-    --input-len 12288
+    --input-len 65536

@@ -224,3 +224,9 @@ def set_kv_buffer_fp8_e4m3_launcher(
         page_size
     )
 
+# Compatibility wrapper for SGLang VTXGraphCachePool.
+# Some SGLang versions import set_kv_buffer_fp8_launcher, while this repo
+# only defines set_kv_buffer_launcher.
+def set_kv_buffer_fp8_launcher(*args, **kwargs):
+    return set_kv_buffer_launcher(*args, **kwargs)
+
