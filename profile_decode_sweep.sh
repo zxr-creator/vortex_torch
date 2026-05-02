@@ -15,9 +15,9 @@ ENABLE_VORTEX=${ENABLE_VORTEX:-1}
 PROFILE_PREFILL=${PROFILE_PREFILL:-0}
 VORTEX_TOPK_VAL=${VORTEX_TOPK_VAL:-29}
 
-vortex_flag="--enable-vortex-sparsity"
+vortex_flag=()
 if [[ "${ENABLE_VORTEX}" == "0" ]]; then
-  vortex_flag="--disable-vortex-sparsity"
+  vortex_flag=(--no-vortex)
 fi
 
 prefill_flag=()
@@ -93,7 +93,7 @@ for midx in "${!MODEL_PATHS[@]}"; do
           --max-new-tokens "${MAX_NEW_TOKENS}" \
           --input-len "${input_len}" \
           --vortex-topk-val "${VORTEX_TOPK_VAL}" \
-          "${vortex_flag}" \
+          "${vortex_flag[@]}" \
           "${prefill_flag[@]}" \
         > "${log_file}" 2>&1
 

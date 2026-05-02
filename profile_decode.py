@@ -109,27 +109,15 @@ def main() -> None:
 
     parser.add_argument("--vortex-algorithm", default="BLOCK_TOPK")
     parser.add_argument(
-        "--enable-vortex-sparsity",
-        dest="enable_vortex_sparsity_flag",
+        "--no-vortex",
         action="store_true",
-        default=True,
-        help="Enable VTXGraphAttnBackend / VTXGraphCachePool (default: True).",
-    )
-    parser.add_argument(
-        "--disable-vortex-sparsity",
-        dest="enable_vortex_sparsity_flag",
-        action="store_false",
-        help="Force full FlashInfer attention (debug only).",
+        help="Force full FlashInfer attention path (debug only). "
+             "Default behaviour is to enable VTXGraphAttnBackend / VTXGraphCachePool.",
     )
     parser.add_argument(
         "--profile-prefill",
         action="store_true",
         help="Move cudaProfilerStart() before prefill so cache-construction kernels are captured.",
-    )
-    parser.add_argument(
-        "--vortex-topk-val",
-        type=int,
-        default=29,
     )
 
     args = parser.parse_args()
@@ -147,11 +135,13 @@ def main() -> None:
 
     # Force VTX FlashInfer backend
     server_args.attention_backend = "flashinfer"
-    server_args.enable_vortex_sparsity = bool(args.enable_vortex_sparsity_flag)
+    server_args.enable_vortex_sparsity = not bool(args.no_vortex)
     server_args.disable_overlap_schedule = True
     server_args.disable_cuda_graph = False
     server_args.vortex_module_name = "block_sparse_attention"
-    server_args.vortex_topk_val = args.vortex_topk_val
+    # vortex_topk_val comes from ServerArgs.add_cli_args (--vortex-topk-val)
+    if not getattr(args, "vortex_topk_val", None):
+        server_args.vortex_topk_val = 29
     server_args.vortex_layers_skip = [0]
     server_args.page_size = 512
     server_args.vortex_block_size = 16
