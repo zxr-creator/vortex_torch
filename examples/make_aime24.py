@@ -36,6 +36,13 @@ def main():
             enable_thinking=args.enable_thinking,
         )
 
+        # DeepSeek-R1-Distill models tend to bypass the thinking pattern
+        # (emitting an empty "<think>\n\n</think>"). The model card recommends
+        # forcing every response to start with "<think>\n" so the model
+        # actually reasons. Append it iff the chat template hasn't already.
+        if not prompt.rstrip().endswith("<think>"):
+            prompt = prompt + "<think>\n"
+
         results.append({
             "id": idx,
             "question": data["problem"],
