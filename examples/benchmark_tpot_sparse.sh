@@ -11,7 +11,7 @@ RESERVED_EOS=1
 MODEL_TAG=$(basename "$MODEL_NAME")
 MODEL_TAG=$(printf "%s" "$MODEL_TAG" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]._-' '-')
 MODULE_TAG=$(printf "%s" "$VORTEX_MODULE_NAME" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]._-' '-')
-OUTPUT_PREFIX="benchmark/benchmark_ttft_tpot_full_attention_topk${TOPK_VAL}_${MODEL_TAG}"
+OUTPUT_PREFIX="benchmark/benchmark_ttft_tpot_${MODULE_TAG}_topk${TOPK_VAL}_${MODEL_TAG}"
 
 python -m sglang.launch_server \
  --model-path "$MODEL_NAME" \
@@ -31,7 +31,9 @@ python -m sglang.launch_server \
  --vortex-compilation-cache-dir "~/.vortex_compilation_cache" \
  --tp-size "$TP_SIZE" \
  --port "$PORT" \
- --host 127.0.0.1 &
+ --host 127.0.0.1 \
+ --enable-vortex-sparsity &
+
 
 SERVER_PID=$!
 

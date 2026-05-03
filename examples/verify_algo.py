@@ -256,10 +256,12 @@ def already_finished(summary_dir, args):
         prev_args = prev.get("args", {})
         if (
             prev_args.get("trials") == args.trials
+            and prev_args.get("topk_val") == args.topk_val
             and prev_args.get("topk_ratio") == args.topk_ratio
             and prev_args.get("vortex_module_name") == args.vortex_module_name
             and prev_args.get("model_name") == args.model_name
             and prev_args.get("data_path") == args.data_path
+            and prev_args.get("tp_size") == args.tp_size
         ):
             return path
     return None

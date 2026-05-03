@@ -247,3 +247,5 @@ RLG
 .codex
 .claude/.nfs*
 *.slurm
+RLG/
+scripts/
