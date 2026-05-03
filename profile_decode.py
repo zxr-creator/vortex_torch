@@ -109,6 +109,12 @@ def main() -> None:
 
     parser.add_argument("--vortex-algorithm", default="BLOCK_TOPK")
     parser.add_argument(
+        "--vortex-module-name",
+        default="block_sparse_attention",
+        help="Registered vortex flow module name (e.g. block_sparse_attention, "
+             "gqa_quest_sparse_attention).",
+    )
+    parser.add_argument(
         "--no-vortex",
         action="store_true",
         help="Force full FlashInfer attention path (debug only). "
@@ -138,7 +144,7 @@ def main() -> None:
     server_args.enable_vortex_sparsity = not bool(args.no_vortex)
     server_args.disable_overlap_schedule = True
     server_args.disable_cuda_graph = False
-    server_args.vortex_module_name = "block_sparse_attention"
+    server_args.vortex_module_name = args.vortex_module_name
     # vortex_topk_val comes from ServerArgs.add_cli_args (--vortex-topk-val)
     if not getattr(args, "vortex_topk_val", None):
         server_args.vortex_topk_val = 29
