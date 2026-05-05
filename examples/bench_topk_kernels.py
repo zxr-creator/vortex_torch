@@ -235,8 +235,17 @@ def compute_recall_at_ks(
     return out
 
 
+# Tolerate-ratio sweep for the approx_remap autotune. The remap reshapes
+# the score distribution, which often shrinks the threshold bin enough
+# that the kernel's Pass-2-fast branch fires at higher α than would
+# otherwise be safe — so combining mapping × tolerate_ratio in one cross-
+# product autotune lets us find pairs like (HALF_SQUARE, α=0.5) that are
+# both ~Pass-2-fast quick AND keep recall ≥ 0.99.
+AUTOTUNE_APPROX_TOLERATE_RATIOS = [0.0, 0.05, 0.1, 0.25, 0.5]
+
+
 def autotune_remap(
-    kernel_factory: Callable[[int, float], Callable[[], None]],
+    kernel_factory: Callable[..., Callable[[], None]],
     out_buf: torch.Tensor,
     out_shape: tuple,
     x: torch.Tensor,
@@ -245,8 +254,9 @@ def autotune_remap(
     topk_val: int,
     reserved_bos: int,
     reserved_eos: int,
+    tolerate_ratios: List[float] = None,
 ) -> Dict[str, float]:
-    """Latency-first autotune across REMAP_CANDIDATES.
+    """Latency-first autotune across REMAP_CANDIDATES (× tolerate_ratios).
 
     Per-candidate we measure mean latency and recall@topk_val. Selection:
       1. Drop any candidate whose recall < RECALL_FLOOR_ABS (correctness gate).
@@ -258,56 +268,74 @@ def autotune_remap(
          recall one anyway (so the caller still gets a runnable config) and
          flag it via baseline_recall_at_topk for downstream analysis.
 
-    `kernel_factory(mode, power)` returns a callable that runs the kernel.
-    Returns: tag, mapping_mode, mapping_power, baseline_recall_at_topk,
-    chosen_latency_ms, chosen_recall_at_topk.
+    When `tolerate_ratios` is None, `kernel_factory(mode, power)` is used
+    (v2_remap mode — no α dimension). When `tolerate_ratios` is a list, we
+    sweep the cross product (REMAP_CANDIDATES × tolerate_ratios) and call
+    `kernel_factory(mode, power, tolerate_ratio)`. Returns include
+    `tolerate_ratio` (NaN when not swept).
     """
-    candidate_results = []  # list of (tag, mode, power, mean_ms, recall)
-    for tag, mode, power in REMAP_CANDIDATES:
-        fn = kernel_factory(mode, power)
-        try:
-            stats = time_kernel(fn, AUTOTUNE_WARMUP, AUTOTUNE_ITERS)
-        except RuntimeError:
-            continue
-        try:
-            out_buf.zero_()
-            fn()
-            torch.cuda.synchronize()
-            selected = out_buf.view(*out_shape)
-            recalls = compute_recall_at_ks(
-                x, selected, eff_batch_size, blocks_per_row,
-                [topk_val], reserved_bos, reserved_eos,
-            )
-            recall = recalls.get(topk_val, float("nan"))
-        except RuntimeError:
-            recall = float("nan")
-        candidate_results.append((tag, mode, power, stats["mean_ms"], recall))
+    sweep_tol = tolerate_ratios is not None
+    tol_grid = list(tolerate_ratios) if sweep_tol else [float("nan")]
 
-    measured = [r for r in candidate_results if r[4] == r[4]]
+    candidate_results = []  # list of (tag_full, tag, mode, power, tol, ms, recall)
+    for tag, mode, power in REMAP_CANDIDATES:
+        for tol in tol_grid:
+            fn = (kernel_factory(mode, power, tol) if sweep_tol
+                  else kernel_factory(mode, power))
+            try:
+                stats = time_kernel(fn, AUTOTUNE_WARMUP, AUTOTUNE_ITERS)
+            except RuntimeError:
+                continue
+            try:
+                out_buf.zero_()
+                fn()
+                torch.cuda.synchronize()
+                selected = out_buf.view(*out_shape)
+                recalls = compute_recall_at_ks(
+                    x, selected, eff_batch_size, blocks_per_row,
+                    [topk_val], reserved_bos, reserved_eos,
+                )
+                recall = recalls.get(topk_val, float("nan"))
+            except RuntimeError:
+                recall = float("nan")
+            tag_full = f"{tag}@tol={tol:g}" if sweep_tol else tag
+            candidate_results.append(
+                (tag_full, tag, mode, power, tol, stats["mean_ms"], recall)
+            )
+
+    measured = [r for r in candidate_results if r[6] == r[6]]
     if not measured:
-        return {"tag": REMAP_CANDIDATES[0][0],
-                "mapping_mode": REMAP_CANDIDATES[0][1],
-                "mapping_power": REMAP_CANDIDATES[0][2],
+        first_tag, first_mode, first_pow = REMAP_CANDIDATES[0]
+        return {"tag": first_tag,
+                "mapping_tag": first_tag,
+                "mapping_mode": first_mode,
+                "mapping_power": first_pow,
+                "tolerate_ratio": (tol_grid[0] if sweep_tol else float("nan")),
                 "baseline_recall_at_topk": float("nan"),
                 "chosen_latency_ms": float("nan"),
                 "chosen_recall_at_topk": float("nan")}
 
-    correct = [r for r in measured if r[4] >= RECALL_FLOOR_ABS]
-    target  = [r for r in correct  if r[4] >= RECALL_FLOOR_TARGET]
+    # Tuple layout: (tag_full, tag, mode, power, tol, ms, recall)
+    correct = [r for r in measured if r[6] >= RECALL_FLOOR_ABS]
+    target  = [r for r in correct  if r[6] >= RECALL_FLOOR_TARGET]
 
     if target:
-        best = min(target, key=lambda r: r[3])
+        best = min(target, key=lambda r: r[5])
     elif correct:
-        best = max(correct, key=lambda r: r[4])
+        best = max(correct, key=lambda r: r[6])
     else:
         # Everything dropped below the absolute floor — keep the highest-
         # recall option but the caller can see it failed correctness.
-        best = max(measured, key=lambda r: r[4])
+        best = max(measured, key=lambda r: r[6])
 
-    return {"tag": best[0], "mapping_mode": best[1], "mapping_power": best[2],
-            "baseline_recall_at_topk": best[4],   # report chosen recall here
-            "chosen_latency_ms": best[3],
-            "chosen_recall_at_topk": best[4]}
+    return {"tag": best[0],
+            "mapping_tag": best[1],
+            "mapping_mode": best[2],
+            "mapping_power": best[3],
+            "tolerate_ratio": best[4],
+            "baseline_recall_at_topk": best[6],
+            "chosen_latency_ms": best[5],
+            "chosen_recall_at_topk": best[6]}
 
 
 def main() -> None:
@@ -398,8 +426,13 @@ def main() -> None:
         # alongside the unmapped kernels for an apples-to-apples comparison.
         # Skipped entirely when the C extension wasn't built with remap.
         if HAS_REMAP:
-            approx_remap_factory = lambda mode, power: (
-                lambda: approx_topk_output_remap(*common_args, 0.0, mode, power)
+            # Approx remap autotune sweeps both the mapping AND the
+            # tolerate_ratio so it can pick combinations like
+            # (HALF_SQUARE, α=0.5) where the remap shrinks the threshold
+            # bin enough that the kernel's Pass-2-fast branch fires while
+            # recall stays ≥ 0.99.
+            approx_remap_factory = lambda mode, power, tol: (
+                lambda: approx_topk_output_remap(*common_args, tol, mode, power)
             )
             topkv2_remap_factory = lambda mode, power: (
                 lambda: topk_output_v2_remap(*common_args, mode, power)
@@ -410,6 +443,7 @@ def main() -> None:
                 (eff_batch_size, per_row_sparse),
                 x, eff_batch_size, blocks_per_row, topk_val,
                 args.reserved_bos, args.reserved_eos,
+                tolerate_ratios=AUTOTUNE_APPROX_TOLERATE_RATIOS,
             )
             topkv2_chosen = autotune_remap(
                 topkv2_remap_factory, sparse_kv_indices,
@@ -420,20 +454,24 @@ def main() -> None:
 
             kernels.append((
                 f"approx_radix_topk_remap@{approx_chosen['tag']}",
-                approx_remap_factory(approx_chosen["mapping_mode"], approx_chosen["mapping_power"]),
-                None, sparse_kv_indices, (eff_batch_size, per_row_sparse),
+                approx_remap_factory(approx_chosen["mapping_mode"],
+                                     approx_chosen["mapping_power"],
+                                     approx_chosen["tolerate_ratio"]),
+                approx_chosen["tolerate_ratio"],
+                sparse_kv_indices, (eff_batch_size, per_row_sparse),
                 {"mapping_mode":  approx_chosen["mapping_mode"],
                  "mapping_power": approx_chosen["mapping_power"],
-                 "mapping_tag":   approx_chosen["tag"],
+                 "mapping_tag":   approx_chosen.get("mapping_tag", approx_chosen["tag"]),
                  "autotune_baseline_recall_at_topk": approx_chosen["baseline_recall_at_topk"]},
             ))
             kernels.append((
                 f"radix_topk_remap@{topkv2_chosen['tag']}",
-                topkv2_remap_factory(topkv2_chosen["mapping_mode"], topkv2_chosen["mapping_power"]),
+                topkv2_remap_factory(topkv2_chosen["mapping_mode"],
+                                     topkv2_chosen["mapping_power"]),
                 None, sparse_kv_indices, (eff_batch_size, per_row_sparse),
                 {"mapping_mode":  topkv2_chosen["mapping_mode"],
                  "mapping_power": topkv2_chosen["mapping_power"],
-                 "mapping_tag":   topkv2_chosen["tag"],
+                 "mapping_tag":   topkv2_chosen.get("mapping_tag", topkv2_chosen["tag"]),
                  "autotune_baseline_recall_at_topk": topkv2_chosen["baseline_recall_at_topk"]},
             ))
 
