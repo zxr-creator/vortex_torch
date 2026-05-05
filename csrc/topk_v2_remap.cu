@@ -325,8 +325,8 @@ constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);
 // Per-arch opt-in ceiling reference (cudaDevAttrMaxSharedMemoryPerBlockOptin):
 //   - RTX PRO 6000 / Blackwell SM_120 : 99 KB  → use 96 KB
 //   - H100 / H200      / Hopper  SM_90 : 228 KB → use 224 KB
-constexpr size_t kSmemMax = 96  * 1024;   // RTX PRO 6000 (Blackwell SM_120)
-// constexpr size_t kSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90)
+constexpr size_t kSmemMax = 80  * 1024;   // RTX PRO 6000 (Blackwell SM_120, ~99 KB opt-in − ~11 KB static)
+// constexpr size_t kSmemMax = 200 * 1024;   // H100 / H200 (Hopper SM_90, 228 KB opt-in)
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
     __half h = __float2half_rn(x);

@@ -315,8 +315,8 @@ constexpr int VORTEX_MAX_TOPK = 2048;
 //   - RTX PRO 6000 / Blackwell SM_120 : 99 KB  → use 96 KB
 //   - H100 / H200      / Hopper  SM_90 : 228 KB → use 224 KB
 // Switch the active line to match the deployment arch.
-constexpr size_t kApproxRemapSmemMax = 96  * 1024;   // RTX PRO 6000 (Blackwell SM_120)
-// constexpr size_t kApproxRemapSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90)
+constexpr size_t kApproxRemapSmemMax = 80  * 1024;   // RTX PRO 6000 (Blackwell SM_120, ~99 KB opt-in − ~11 KB static)
+// constexpr size_t kApproxRemapSmemMax = 200 * 1024;   // H100 / H200 (Hopper SM_90, 228 KB opt-in)
 
 template <auto* f, size_t max_dynamic_smem>
 void approx_setup_kernel_smem_once() {
