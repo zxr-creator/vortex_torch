@@ -15,6 +15,11 @@
 #     ( 2048, 131072)   #   2M tokens, 1.6% selected
 #   distributions: uniform / normal / real (lognormal proxy) / bimodal
 #
+# Each measurement also reports recall@k for k ∈ {32, 64, 128, topk_val}:
+# the fraction of the kernel's top-k true blocks (torch.topk over the
+# candidate region, excluding reserved BOS/EOS) that the kernel's selected
+# set covers.
+#
 # Per-measurement records land in JSONL; a flat CSV-style summary is
 # printed at the end and saved next to the JSONL.
 #
@@ -117,6 +122,9 @@ cols = [
     "kernel", "tolerate_ratio",
     "num_kv_heads", "eff_batch_size",
     "mean_ms", "p50_ms", "p95_ms", "min_ms",
+    "recall_at_32", "recall_at_64", "recall_at_128", "recall_at_topk",
+    "mapping_mode", "mapping_power", "mapping_tag",
+    "autotune_baseline_recall_at_topk",
 ]
 
 rows = []
