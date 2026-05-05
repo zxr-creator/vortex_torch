@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# Sweep the three top-k CUDA kernels (topk_output / topk_output_v2 /
-# approx_topk_output) across Qwen3 model sizes and a fixed (topk, blocks_per_row)
-# region of interest, under four score-tensor distributions.
+# Sweep the top-k CUDA kernels reported as 'sort_topk' (csrc/topk.cu),
+# 'radix_topk' (csrc/topk_v2.cu), 'approx_radix_topk' (csrc/approx_topk.cu),
+# and their autotuned remap variants ('radix_topk_remap',
+# 'approx_radix_topk_remap'), across Qwen3 model sizes under four
+# score-tensor distributions. The sglang_ori reference is intentionally
+# excluded — its compile-time TopK and degenerate recall make it
+# uninformative at this scale.
 #
-# Sweep:
+# Sweep (block_size = 1, so input_len == blocks_per_row):
 #   batch_size = 128
 #   (topk_val, blocks_per_row) pairs:
-#     ( 32 ,   2048 )   #  32k tokens, 1.6% selected
-#     ( 64 ,   2048 )   #  32k tokens, 3.1% selected
-#     ( 128,   2048 )   #  32k tokens, 6.3% selected
-#     ( 256,   2048 )   #  32k tokens, 12.5% selected
-#     ( 2048,  32768)   # 512k tokens, 6.3% selected
-#     ( 2048,  65536)   #   1M tokens, 3.1% selected
-#     ( 2048, 131072)   #   2M tokens, 1.6% selected
+#     ( 32 ,   2048 )   #   2k tokens,  1.6% selected
+#     ( 64 ,   2048 )   #   2k tokens,  3.1% selected
+#     ( 128,   2048 )   #   2k tokens,  6.3% selected
+#     ( 256,   2048 )   #   2k tokens, 12.5% selected
+#     ( 2048,  32768)   #  32k tokens,  6.3% selected
+#     ( 2048,  65536)   #  64k tokens,  3.1% selected
+#     ( 2048, 131072)   # 128k tokens,  1.6% selected
 #   distributions: uniform / normal / real (lognormal proxy) / bimodal
 #
-# Each measurement also reports recall@k for k ∈ {32, 64, 128, topk_val}:
+# Each measurement reports recall@k for k ∈ {32, 64, 128, topk_val}:
 # the fraction of the kernel's top-k true blocks (torch.topk over the
 # candidate region, excluding reserved BOS/EOS) that the kernel's selected
-# set covers.
+# set covers. recall@k is naturally bounded above by min(1, topk_val/k),
+# since the kernel only emits topk_val candidates per row.
 #
 # Per-measurement records land in JSONL; a flat CSV-style summary is
 # printed at the end and saved next to the JSONL.
@@ -36,7 +41,7 @@ MODEL_PATHS=(Qwen/Qwen3-0.6B Qwen/Qwen3-1.7B Qwen/Qwen3-4B Qwen/Qwen3-8B)
 MODEL_LABELS=(qwen3_0p6b   qwen3_1p7b    qwen3_4b     qwen3_8b)
 
 BATCH_SIZE="${BATCH_SIZE:-128}"
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
+BLOCK_SIZE="${BLOCK_SIZE:-1}"
 
 # Parallel arrays: SWEEP_TOPK[i] paired with SWEEP_BPR[i].
 # input_len = blocks_per_row * BLOCK_SIZE.

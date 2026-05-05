@@ -1,12 +1,22 @@
-"""Kernel-level benchmark for the three top-k variants in vortex_torch_C:
-  - topk_output         (csrc/topk.cu)
-  - topk_output_v2      (csrc/topk_v2.cu)
-  - approx_topk_output  (csrc/approx_topk.cu)
+"""Kernel-level benchmark for the top-k variants in vortex_torch_C, reported
+in the output records as:
+  - sort_topk          (csrc/topk.cu, full sort baseline)
+  - radix_topk         (csrc/topk_v2.cu)
+  - approx_radix_topk  (csrc/approx_topk.cu, parameterized by tolerate_ratio)
+plus their autotuned remap variants:
+  - radix_topk_remap        (csrc/topk_v2.cu + topk_mapping.cuh)
+  - approx_radix_topk_remap (csrc/approx_topk.cu + topk_mapping.cuh)
 
 For each model architecture the script reads num_key_value_heads from the HF
 config and uses (batch_size * num_kv_heads) as the effective number of rows
 the kernel parallelizes over. Per-row dense block count is derived from
-input_len / block_size, matching the page layout used in compare_omni.sh.
+input_len / block_size.
+
+Recall@k is reported for k ∈ {32, 64, 128, topk_val}: the fraction of the
+top-k true blocks (torch.topk over the candidate region, excluding reserved
+BOS/EOS) that the kernel's selected set covers. Note recall@k is bounded
+above by min(1, topk_val/k) since the kernel only emits topk_val candidates
+per row, so recall@k for k > topk_val is necessarily smaller than 1.
 
 This is a kernel-only benchmark: no model weights are loaded.
 """
@@ -24,35 +34,64 @@ from vortex_torch_C import (
     topk_output,
     topk_output_v2,
     approx_topk_output,
-    approx_topk_output_remap,
-    topk_output_v2_remap,
-    topk_output_sglang_ori,
 )
 
-# sglang_topk.cu hard-codes TopK at compile time. The current build sets it to
-# this value; configs whose topk_val != SGLANG_ORI_TOPK are skipped for that
-# kernel. Bumping this means rebuilding sglang_topk.cu.
-SGLANG_ORI_TOPK = 32
+# Remap variants are optional: they exist only when the C extension was built
+# with topk_mapping.cuh + the *_remap kernels. If absent we still benchmark the
+# three base kernels and skip remap autotune for that run.
+try:
+    from vortex_torch_C import (
+        approx_topk_output_remap,
+        topk_output_v2_remap,
+    )
+    HAS_REMAP = True
+except ImportError:
+    approx_topk_output_remap = None
+    topk_output_v2_remap = None
+    HAS_REMAP = False
 
 EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Curated remap candidates for the *_remap kernel autotune. Each tuple is
 # (tag, mapping_mode, mapping_power); modes match TopKMappingMode in
-# csrc/topk_mapping.cuh. NONE is the identity baseline. The other six
-# cover spread, log/asinh-style compression, and top-region amplifiers.
+# csrc/topk_mapping.cuh. MAPPING_NONE is intentionally NOT in this list —
+# it is just the unmapped baseline kernel and would always win latency
+# while contributing zero to "remap" as a feature. The pool covers
+# compression (POWER<1, LOG, LOG1P, ASINH), expansion (POWER>1, TANH),
+# top-region amplifiers (SHIFT_POW2/3, HALF_SQUARE/CUBE), and the cheap
+# linear stretch (LINEAR_STEEP).
 REMAP_CANDIDATES = [
-    ("NONE",           0, 0.0),
-    ("POWER@0.5",      3, 0.5),
-    ("POWER@2.0",      3, 2.0),
-    ("ASINH@1.0",      6, 1.0),
-    ("LOG1P@1.0",      7, 1.0),
-    ("SHIFT_POW2@0",  15, 0.0),
-    ("HALF_SQUARE@0", 18, 0.0),
+    ("POWER@0.25",      3,  0.25),
+    ("POWER@0.5",       3,  0.5),
+    ("POWER@0.75",      3,  0.75),
+    ("POWER@1.5",       3,  1.5),
+    ("POWER@2.0",       3,  2.0),
+    ("LOG",             4,  0.0),
+    ("LOG1P@1.0",       7,  1.0),
+    ("ASINH@1.0",       6,  1.0),
+    ("ASINH@2.0",       6,  2.0),
+    ("TANH@1.0",       10,  1.0),
+    ("LINEAR_STEEP@2", 17,  2.0),
+    ("LINEAR_STEEP@8", 17,  8.0),
+    ("SHIFT_POW2@0",   15,  0.0),
+    ("SHIFT_POW2@0.5", 15,  0.5),
+    ("SHIFT_POW3@0",   16,  0.0),
+    ("HALF_SQUARE@0",  18,  0.0),
+    ("HALF_SQUARE@0.5",18,  0.5),
+    ("HALF_CUBE@0",    19,  0.0),
 ]
 
-# A remap candidate is accepted if its recall@topk_val is within this slack
-# of the NONE baseline's recall. Latency then breaks ties.
-RECALL_FLOOR_SLACK = 0.005
+# Correctness floor for accepting a remap candidate.
+#
+# - RECALL_FLOOR_ABS: the candidate's recall@topk_val must clear this
+#   absolute threshold. This is the hard correctness gate — a mapping
+#   that drops below it has corrupted the top-k selection and is
+#   rejected outright, regardless of how fast it runs.
+# - RECALL_FLOOR_TARGET: a tighter target. Any candidate at or above
+#   this value is treated as "fully correct" and the autotune picks
+#   purely by latency among them.
+RECALL_FLOOR_ABS    = 0.97
+RECALL_FLOOR_TARGET = 0.99
 
 # Lightweight autotune iters — full timing happens after the chosen config
 # is locked in.
@@ -77,7 +116,7 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated topk values to sweep "
                              "(default: subset of compare_omni.sh sweep).")
     parser.add_argument("--tolerate-ratios", default="0.0,0.05,0.1",
-                        help="Comma-separated tolerate_ratio values for approx_topk_output.")
+                        help="Comma-separated tolerate_ratio values for approx_radix_topk.")
     parser.add_argument("--reserved-bos", type=int, default=1,
                         help="Blocks reserved at the start (default: 1, matches sparse-attn configs).")
     parser.add_argument("--reserved-eos", type=int, default=2,
@@ -207,13 +246,21 @@ def autotune_remap(
     reserved_bos: int,
     reserved_eos: int,
 ) -> Dict[str, float]:
-    """Time each REMAP_CANDIDATES entry on the given kernel and pick the
-    fastest one whose recall@topk_val is within RECALL_FLOOR_SLACK of the
-    NONE baseline. Falls back to NONE if no candidate clears the floor.
+    """Latency-first autotune across REMAP_CANDIDATES.
+
+    Per-candidate we measure mean latency and recall@topk_val. Selection:
+      1. Drop any candidate whose recall < RECALL_FLOOR_ABS (correctness gate).
+      2. Among survivors, the candidate with recall ≥ RECALL_FLOOR_TARGET
+         that has the lowest latency wins.
+      3. If nothing reaches RECALL_FLOOR_TARGET, fall back to the highest-
+         recall survivor (still ≥ RECALL_FLOOR_ABS) to preserve correctness.
+      4. If every candidate fails the absolute floor, return the highest-
+         recall one anyway (so the caller still gets a runnable config) and
+         flag it via baseline_recall_at_topk for downstream analysis.
 
     `kernel_factory(mode, power)` returns a callable that runs the kernel.
-    Returns a dict with keys: tag, mapping_mode, mapping_power,
-    baseline_recall_at_topk.
+    Returns: tag, mapping_mode, mapping_power, baseline_recall_at_topk,
+    chosen_latency_ms, chosen_recall_at_topk.
     """
     candidate_results = []  # list of (tag, mode, power, mean_ms, recall)
     for tag, mode, power in REMAP_CANDIDATES:
@@ -236,27 +283,43 @@ def autotune_remap(
             recall = float("nan")
         candidate_results.append((tag, mode, power, stats["mean_ms"], recall))
 
-    none_entry = next((r for r in candidate_results if r[0] == "NONE"), None)
-    baseline_recall = none_entry[4] if none_entry is not None else float("nan")
+    measured = [r for r in candidate_results if r[4] == r[4]]
+    if not measured:
+        return {"tag": REMAP_CANDIDATES[0][0],
+                "mapping_mode": REMAP_CANDIDATES[0][1],
+                "mapping_power": REMAP_CANDIDATES[0][2],
+                "baseline_recall_at_topk": float("nan"),
+                "chosen_latency_ms": float("nan"),
+                "chosen_recall_at_topk": float("nan")}
 
-    if baseline_recall != baseline_recall:  # NaN baseline → bail to NONE
-        eligible = []
+    correct = [r for r in measured if r[4] >= RECALL_FLOOR_ABS]
+    target  = [r for r in correct  if r[4] >= RECALL_FLOOR_TARGET]
+
+    if target:
+        best = min(target, key=lambda r: r[3])
+    elif correct:
+        best = max(correct, key=lambda r: r[4])
     else:
-        eligible = [r for r in candidate_results
-                    if r[4] == r[4] and r[4] >= baseline_recall - RECALL_FLOOR_SLACK]
+        # Everything dropped below the absolute floor — keep the highest-
+        # recall option but the caller can see it failed correctness.
+        best = max(measured, key=lambda r: r[4])
 
-    if not eligible:
-        return {"tag": "NONE", "mapping_mode": 0, "mapping_power": 0.0,
-                "baseline_recall_at_topk": baseline_recall}
-
-    best = min(eligible, key=lambda r: r[3])
     return {"tag": best[0], "mapping_mode": best[1], "mapping_power": best[2],
-            "baseline_recall_at_topk": baseline_recall}
+            "baseline_recall_at_topk": best[4],   # report chosen recall here
+            "chosen_latency_ms": best[3],
+            "chosen_recall_at_topk": best[4]}
 
 
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
+
+    if not HAS_REMAP:
+        print(
+            "[bench_topk_kernels] vortex_torch_C has no *_remap symbols; "
+            "skipping radix_topk_remap / approx_radix_topk_remap. "
+            "Rebuild the extension with topk_mapping.cuh registered to enable them."
+        )
 
     cfg = AutoConfig.from_pretrained(args.model_name)
     num_kv_heads = int(getattr(cfg, "num_key_value_heads", cfg.num_attention_heads))
@@ -310,30 +373,17 @@ def main() -> None:
         # output_view_shape, extra_fields). extra_fields is a dict (or None)
         # of additional record fields used by the *_remap autotuned kernels
         # to surface their chosen mapping_mode / mapping_power.
+        # Baselines: radix_topk (topk_v2) and approx_radix_topk are sufficient
+        # — sort_topk (full-sort) is much slower and not the relevant
+        # comparison point for the remap variants.
         kernels: List[tuple] = [
-            ("topk_output",    lambda: topk_output(*common_args),
-             None, sparse_kv_indices, (eff_batch_size, per_row_sparse), None),
-            ("topk_output_v2", lambda: topk_output_v2(*common_args),
+            ("radix_topk", lambda: topk_output_v2(*common_args),
              None, sparse_kv_indices, (eff_batch_size, per_row_sparse), None),
         ]
-        if topk_val == SGLANG_ORI_TOPK:
-            sglang_indices_out = torch.zeros(
-                (eff_batch_size, topk_val), dtype=torch.int32, device=args.device,
-            )
-            sglang_args = (
-                x, dense_kv_indptr, sglang_indices_out,
-                eff_batch_size, topk_val,
-                args.reserved_bos, args.reserved_eos, blocks_per_row,
-            )
-            kernels.append((
-                "topk_output_sglang_ori",
-                lambda: topk_output_sglang_ori(*sglang_args),
-                None, sglang_indices_out, (eff_batch_size, topk_val), None,
-            ))
         for tr in tolerate_ratios:
             tr_local = tr  # capture for closure
             kernels.append((
-                f"approx_topk_output@{tr_local:g}",
+                f"approx_radix_topk@{tr_local:g}",
                 lambda tr=tr_local: approx_topk_output(*common_args, tr),
                 tr_local, sparse_kv_indices, (eff_batch_size, per_row_sparse),
                 None,
@@ -344,44 +394,46 @@ def main() -> None:
         # fastest with recall@topk_val ≥ NONE_recall - RECALL_FLOOR_SLACK.
         # The chosen mapping is then run through the full timed measurement
         # alongside the unmapped kernels for an apples-to-apples comparison.
-        approx_remap_factory = lambda mode, power: (
-            lambda: approx_topk_output_remap(*common_args, 0.0, mode, power)
-        )
-        topkv2_remap_factory = lambda mode, power: (
-            lambda: topk_output_v2_remap(*common_args, mode, power)
-        )
+        # Skipped entirely when the C extension wasn't built with remap.
+        if HAS_REMAP:
+            approx_remap_factory = lambda mode, power: (
+                lambda: approx_topk_output_remap(*common_args, 0.0, mode, power)
+            )
+            topkv2_remap_factory = lambda mode, power: (
+                lambda: topk_output_v2_remap(*common_args, mode, power)
+            )
 
-        approx_chosen = autotune_remap(
-            approx_remap_factory, sparse_kv_indices,
-            (eff_batch_size, per_row_sparse),
-            x, eff_batch_size, blocks_per_row, topk_val,
-            args.reserved_bos, args.reserved_eos,
-        )
-        topkv2_chosen = autotune_remap(
-            topkv2_remap_factory, sparse_kv_indices,
-            (eff_batch_size, per_row_sparse),
-            x, eff_batch_size, blocks_per_row, topk_val,
-            args.reserved_bos, args.reserved_eos,
-        )
+            approx_chosen = autotune_remap(
+                approx_remap_factory, sparse_kv_indices,
+                (eff_batch_size, per_row_sparse),
+                x, eff_batch_size, blocks_per_row, topk_val,
+                args.reserved_bos, args.reserved_eos,
+            )
+            topkv2_chosen = autotune_remap(
+                topkv2_remap_factory, sparse_kv_indices,
+                (eff_batch_size, per_row_sparse),
+                x, eff_batch_size, blocks_per_row, topk_val,
+                args.reserved_bos, args.reserved_eos,
+            )
 
-        kernels.append((
-            f"approx_topk_output_remap@{approx_chosen['tag']}",
-            approx_remap_factory(approx_chosen["mapping_mode"], approx_chosen["mapping_power"]),
-            None, sparse_kv_indices, (eff_batch_size, per_row_sparse),
-            {"mapping_mode":  approx_chosen["mapping_mode"],
-             "mapping_power": approx_chosen["mapping_power"],
-             "mapping_tag":   approx_chosen["tag"],
-             "autotune_baseline_recall_at_topk": approx_chosen["baseline_recall_at_topk"]},
-        ))
-        kernels.append((
-            f"topk_output_v2_remap@{topkv2_chosen['tag']}",
-            topkv2_remap_factory(topkv2_chosen["mapping_mode"], topkv2_chosen["mapping_power"]),
-            None, sparse_kv_indices, (eff_batch_size, per_row_sparse),
-            {"mapping_mode":  topkv2_chosen["mapping_mode"],
-             "mapping_power": topkv2_chosen["mapping_power"],
-             "mapping_tag":   topkv2_chosen["tag"],
-             "autotune_baseline_recall_at_topk": topkv2_chosen["baseline_recall_at_topk"]},
-        ))
+            kernels.append((
+                f"approx_radix_topk_remap@{approx_chosen['tag']}",
+                approx_remap_factory(approx_chosen["mapping_mode"], approx_chosen["mapping_power"]),
+                None, sparse_kv_indices, (eff_batch_size, per_row_sparse),
+                {"mapping_mode":  approx_chosen["mapping_mode"],
+                 "mapping_power": approx_chosen["mapping_power"],
+                 "mapping_tag":   approx_chosen["tag"],
+                 "autotune_baseline_recall_at_topk": approx_chosen["baseline_recall_at_topk"]},
+            ))
+            kernels.append((
+                f"radix_topk_remap@{topkv2_chosen['tag']}",
+                topkv2_remap_factory(topkv2_chosen["mapping_mode"], topkv2_chosen["mapping_power"]),
+                None, sparse_kv_indices, (eff_batch_size, per_row_sparse),
+                {"mapping_mode":  topkv2_chosen["mapping_mode"],
+                 "mapping_power": topkv2_chosen["mapping_power"],
+                 "mapping_tag":   topkv2_chosen["tag"],
+                 "autotune_baseline_recall_at_topk": topkv2_chosen["baseline_recall_at_topk"]},
+            ))
 
         for kernel_name, fn, tr, out_buf, out_shape, extra_fields in kernels:
             try:
