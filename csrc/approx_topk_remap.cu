@@ -315,7 +315,7 @@ constexpr int VORTEX_MAX_TOPK = 2048;
 //   - RTX PRO 6000 / Blackwell SM_120 : 99 KB  → use 96 KB
 //   - H100 / H200      / Hopper  SM_90 : 228 KB → use 224 KB
 // Switch the active line to match the deployment arch.
-constexpr size_t kApproxRemapSmemMax = 88  * 1024;   // RTX PRO 6000 (Blackwell SM_120, ~99 KB opt-in − ~11 KB static)
+constexpr size_t kApproxRemapSmemMax = 80  * 1024;   // RTX PRO 6000 (Blackwell SM_120, ~99 KB opt-in − ~11 KB static)
 // constexpr size_t kApproxRemapSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90, 228 KB opt-in)
 
 template <auto* f, size_t max_dynamic_smem>
@@ -431,10 +431,12 @@ __device__ void approx_topk_remap_inner(
     const int tbin0        = s_threshold_bin;
     const int last_remain0 = s_last_remain;
 
-    // Degenerate-bin guard (same reasoning as approx_topk.cu): if the
-    // threshold bin is bigger than the at-threshold SMEM cache, take the
+    // Degenerate-bin guard: same as in approx_topk.cu. If the threshold
+    // bin alone is bigger than the at-threshold SMEM cache, take the
     // stochastic fast path instead of paying for the slow path's full
-    // re-iteration + heavy sub-bin atomicAdd contention.
+    // re-iteration + heavy sub-bin atomicAdd contention. This matches the
+    // behavior of the unmapped baseline so the remap variant never
+    // regresses on degenerate distributions.
     const int hist_at_tbin0       = hist[tbin0];
     const int hist_strictly_above = (tbin0 + 1 < RADIX) ? hist[tbin0 + 1] : 0;
     const int count_at_threshold  = hist_at_tbin0 - hist_strictly_above;

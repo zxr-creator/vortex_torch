@@ -378,7 +378,7 @@ void approx_setup_kernel_smem_once_local() {
                 ::cudaGetErrorString(result));
 }
 
-constexpr size_t kApproxSmemMax = 88 * 1024;   // RTX PRO 6000 (Blackwell SM_120)
+constexpr size_t kApproxSmemMax = 80 * 1024;   // RTX PRO 6000 (Blackwell SM_120)
 // constexpr size_t kApproxSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90)
 
 template <typename ScoreT>
