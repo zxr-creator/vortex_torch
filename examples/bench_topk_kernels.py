@@ -337,6 +337,23 @@ def autotune_remap(
         # recall option but the caller can see it failed correctness.
         best = max(measured, key=lambda r: r[6])
 
+    # Tie-break against the internal NONE probe. Autotune iteration counts
+    # are short enough (~25 timed runs) that small measurement noise can
+    # let a real mapping look 1-3% faster than NONE while actually being
+    # 10%+ slower in the full bench — see e.g. TANH@1.0 picked over NONE
+    # at uniform L=131k. So if the picked mapping isn't *meaningfully*
+    # faster than NONE (>= MAPPING_WIN_MARGIN improvement), prefer NONE.
+    MAPPING_WIN_MARGIN = 0.95  # picked must be ≤ 0.95× NONE's latency
+    if best[1] != "NONE":
+        none_entries = [r for r in measured if r[1] == "NONE"]
+        if none_entries:
+            # Find best NONE (could be different α if tolerate sweep)
+            none_entries_correct = [r for r in none_entries if r[6] >= RECALL_FLOOR_ABS]
+            if none_entries_correct:
+                best_none = min(none_entries_correct, key=lambda r: r[5])
+                if best[5] > MAPPING_WIN_MARGIN * best_none[5]:
+                    best = best_none  # fallback to NONE
+
     return {"tag": best[0],
             "mapping_tag": best[1],
             "mapping_mode": best[2],

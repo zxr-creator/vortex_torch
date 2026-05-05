@@ -1,13 +1,14 @@
 """Plot top-k kernel latency for a top-ML-conference figure.
 
 A 2 x 4 grid of subfigures, single PDF:
-  Row 1 (top)    : short context  (2k)   — one column per distribution
-  Row 2 (bottom) : long context   (128k) — one column per distribution
+  Row 1 (top)    : short context  (2k)               — one column per distribution
+  Row 2 (bottom) : long context   (avg 32k/64k/128k) — one column per distribution
 
 Distributions: bimodal / normal / real / uniform.
 Each subfigure: grouped bars where x = model size and groups = sparse
 top-k algorithm family. Per-config best variant (min mean_ms across
-mapping / tolerate-ratio variants). No error bars.
+mapping / tolerate-ratio variants); the long-context row additionally
+averages over the three input lengths 32k, 64k, 128k. No error bars.
 """
 
 from pathlib import Path
@@ -20,8 +21,8 @@ import pandas as pd
 CSV = Path("/data/datasets/xinrui/My_Projects/v0.3/vortex_torch/examples/topk_bench_20260505_215943.csv")
 OUT = Path("/data/datasets/xinrui/topk_kernels.pdf")
 
-LOW_LABEL  = "2k"
-LONG_LABEL = "128k"
+SHORT_LABELS = ["2k"]
+LONG_LABELS  = ["32k", "64k", "128k"]
 
 # ----- conference-quality matplotlib defaults --------------------------------
 mpl.rcParams.update({
@@ -97,22 +98,26 @@ DIST_LABEL = {
 def load() -> pd.DataFrame:
     df = pd.read_csv(CSV)
     df["family"] = df["kernel"].map(family_of)
-    return df[df["input_label"].isin([LOW_LABEL, LONG_LABEL])].copy()
+    return df[df["input_label"].isin(SHORT_LABELS + LONG_LABELS)].copy()
 
 
-def latency_table(df: pd.DataFrame, input_label: str,
+def latency_table(df: pd.DataFrame, input_labels: list[str],
                   distribution: str) -> pd.DataFrame:
-    """(model x family) latency table in ms for one (input_label, distribution).
+    """(model x family) latency table in ms for one distribution.
 
-    Per (model, family) we take the best (min mean_ms) across mapping /
-    tolerate-ratio variants — no averaging across distributions.
+    For each input_label in `input_labels` we take the best (min mean_ms)
+    per (model, family) across mapping / tolerate-ratio variants, then
+    average those per-length bests across the supplied input_labels.
     """
-    sub = df[(df["input_label"] == input_label)
+    sub = df[(df["input_label"].isin(input_labels))
              & (df["distribution"] == distribution)]
-    best = (sub.groupby(["model", "family"])["mean_ms"]
+    best = (sub.groupby(["model", "family", "input_label"])["mean_ms"]
                .min()
                .reset_index())
-    pv = best.pivot(index="model", columns="family", values="mean_ms")
+    avg = (best.groupby(["model", "family"])["mean_ms"]
+              .mean()
+              .reset_index())
+    pv = avg.pivot(index="model", columns="family", values="mean_ms")
     return pv.reindex(index=MODEL_ORDER, columns=FAMILY_ORDER)
 
 
@@ -145,21 +150,32 @@ def draw_panel(ax, pv: pd.DataFrame, title: str, ylabel_show: bool,
 
 
 def fig_grid(df: pd.DataFrame) -> None:
-    fig, axes = plt.subplots(2, 4, figsize=(13.5, 5.6),
-                             gridspec_kw={"wspace": 0.30, "hspace": 0.42})
+    fig, axes = plt.subplots(2, 4, figsize=(13.5, 6.0),
+                             gridspec_kw={"wspace": 0.30, "hspace": 0.55,
+                                          "top": 0.86})
 
-    rows = [(LOW_LABEL,  "Short context (2k)"),
-            (LONG_LABEL, "Long context (128k)")]
+    rows = [(SHORT_LABELS, "Short context (2k)"),
+            (LONG_LABELS,  "Long context (avg over 32k / 64k / 128k)")]
 
-    for r, (input_label, ctx_name) in enumerate(rows):
+    for r, (labels, _ctx_name) in enumerate(rows):
         for c, dist in enumerate(DIST_ORDER):
             ax = axes[r, c]
-            pv = latency_table(df, input_label, dist)
+            pv = latency_table(df, labels, dist)
             tag = chr(ord('a') + r * 4 + c)  # a..h
-            title = f"({tag}) {ctx_name} – {DIST_LABEL[dist]}"
+            title = f"({tag}) {DIST_LABEL[dist]}"
             draw_panel(ax, pv, title,
                        ylabel_show=(c == 0),
                        xlabel_show=(r == 1))
+
+    # Row banners — one descriptor per row.
+    for r, (_labels, ctx_name) in enumerate(rows):
+        # y position halfway between the row's top axes title and the
+        # axes top in figure coordinates.
+        bbox = axes[r, 0].get_position()
+        y = bbox.y1 + 0.055
+        fig.text(0.5, y, ctx_name,
+                 ha="center", va="bottom",
+                 fontsize=11, fontweight="bold")
 
     # Single shared legend at the top.
     handles, labels = axes[0, 0].get_legend_handles_labels()
@@ -172,9 +188,9 @@ def fig_grid(df: pd.DataFrame) -> None:
     print(f"wrote {OUT}")
 
     # Dump the underlying numbers for the paper text.
-    for input_label, ctx_name in rows:
+    for labels, ctx_name in rows:
         for dist in DIST_ORDER:
-            pv = latency_table(df, input_label, dist)
+            pv = latency_table(df, labels, dist)
             print(f"\n=== latency (ms), {ctx_name}, distribution={dist} ===")
             print(pv.round(4))
 
