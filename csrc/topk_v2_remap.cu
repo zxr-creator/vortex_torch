@@ -317,11 +317,16 @@ constexpr size_t kSmem = 48 * 1024;
 constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);
 #endif
 
-// Upper bound on dynamic SMEM the slow-path kernel may opt into. Sized to
-// match the per-block opt-in ceiling on Hopper / Blackwell (≤ 100 KB).
-// At launch we use kSmem + bins_bytes when it fits, else dispatch to the
-// uncached kernel.
-constexpr size_t kSmemMax = 96 * 1024;
+// Upper bound on dynamic SMEM the slow-path kernel may opt into. Capped
+// at the per-block opt-in ceiling on the target GPU. At launch we use
+// kSmem + bins_bytes when it fits, else dispatch the USE_CACHE=false
+// specialization (kSmem only, no s_bins).
+//
+// Per-arch opt-in ceiling reference (cudaDevAttrMaxSharedMemoryPerBlockOptin):
+//   - RTX PRO 6000 / Blackwell SM_120 : 99 KB  → use 96 KB
+//   - H100 / H200      / Hopper  SM_90 : 228 KB → use 224 KB
+constexpr size_t kSmemMax = 96  * 1024;   // RTX PRO 6000 (Blackwell SM_120)
+// constexpr size_t kSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90)
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
     __half h = __float2half_rn(x);

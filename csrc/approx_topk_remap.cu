@@ -306,9 +306,17 @@ constexpr int kThreadsPerBlock = 1024;
 constexpr int RADIX = 256;
 constexpr int VORTEX_MAX_TOPK = 2048;
 
-// Maximum dynamic SMEM the approx slow-path kernel may opt into. Sized to
-// hold s_bins[length] for length up to 131072 plus alignment slack.
-constexpr size_t kApproxRemapSmemMax = 160 * 1024;
+// Maximum dynamic SMEM the approx slow-path kernel may opt into. Capped
+// at the per-block opt-in ceiling on the target GPU. At launch we use
+// bins_bytes when it fits, else dispatch the USE_CACHE=false
+// specialization which uses no dynamic SMEM.
+//
+// Per-arch opt-in ceiling reference (cudaDevAttrMaxSharedMemoryPerBlockOptin):
+//   - RTX PRO 6000 / Blackwell SM_120 : 99 KB  → use 96 KB
+//   - H100 / H200      / Hopper  SM_90 : 228 KB → use 224 KB
+// Switch the active line to match the deployment arch.
+constexpr size_t kApproxRemapSmemMax = 96  * 1024;   // RTX PRO 6000 (Blackwell SM_120)
+// constexpr size_t kApproxRemapSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90)
 
 template <auto* f, size_t max_dynamic_smem>
 void approx_setup_kernel_smem_once() {
