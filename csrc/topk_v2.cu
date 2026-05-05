@@ -344,10 +344,14 @@
  constexpr size_t kSmem = 48 * 1024;  // bytes
  #endif
  #else
- // Reduced from 128KB to 32KB to improve occupancy.
- // Each radix pass needs at most ~TopK candidates in the threshold bin,
- // so 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
- constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
+ // 32KB → 64KB. With 32KB the at-threshold cache holds 4K entries per
+ // round, which overflows on degenerate distributions (e.g., uniform-bf16
+ // at L=131k where one giant central bin holds tens of thousands of
+ // elements). Overflow elements get dropped by the `pos < SMEM_INPUT_SIZE`
+ // guard in Pass 2, which collapses recall from ~1.0 to ~0.55. Doubling to
+ // 64KB (8K entries per round) keeps occupancy at 2 blocks/SM on Blackwell
+ // and rescues recall on those configs.
+ constexpr size_t kSmem = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
  #endif
 
  __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {

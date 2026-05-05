@@ -314,7 +314,10 @@ constexpr size_t kSmem = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
 constexpr size_t kSmem = 48 * 1024;
 #endif
 #else
-constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);
+// 32KB → 64KB; matches the bump in topk_v2.cu. With 32KB the at-threshold
+// cache (4K entries / round) overflowed on degenerate distributions and
+// dropped recall to ~0.55 at uniform L=131k.
+constexpr size_t kSmem = 16 * 1024 * sizeof(uint32_t);
 #endif
 
 // Upper bound on dynamic SMEM the slow-path kernel may opt into. Capped

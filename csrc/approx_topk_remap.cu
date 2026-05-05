@@ -431,18 +431,11 @@ __device__ void approx_topk_remap_inner(
     const int tbin0        = s_threshold_bin;
     const int last_remain0 = s_last_remain;
 
-    // Degenerate-bin guard: same as in approx_topk.cu. If the threshold
-    // bin alone is bigger than the at-threshold SMEM cache, take the
-    // stochastic fast path instead of paying for the slow path's full
-    // re-iteration + heavy sub-bin atomicAdd contention. This matches the
-    // behavior of the unmapped baseline so the remap variant never
-    // regresses on degenerate distributions.
-    const int hist_at_tbin0       = hist[tbin0];
-    const int hist_strictly_above = (tbin0 + 1 < RADIX) ? hist[tbin0 + 1] : 0;
-    const int count_at_threshold  = hist_at_tbin0 - hist_strictly_above;
-    const bool degenerate_bin     = count_at_threshold > kApproxRemapSmemInputSize;
-
-    if (last_remain0 <= tolerate_thresh || degenerate_bin) {
+    // Fast path fires only on explicit tolerate_thresh opt-in. No
+    // degenerate-bin auto-fallback (matches the unmapped baseline) so
+    // recall stays exact at α=0 even when the mapping doesn't fully
+    // shrink the threshold bin.
+    if (last_remain0 <= tolerate_thresh) {
         // Early-termination: 1 pass over length, no Stage-2 refinement.
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
             const float raw    = to_float<ScoreT>(input[idx]);

@@ -441,24 +441,14 @@ __device__ void approx_topk_inner(
     const int tbin0        = s_threshold_bin;
     const int last_remain0 = s_last_remain;
 
-    // hist[] currently holds the descending suffix sum, so the size of the
-    // threshold bin itself is `hist[tbin0] - hist[tbin0+1]`. When that
-    // count exceeds the at-threshold cache, the slow-path's Stage-2 sub-bin
-    // histogram becomes badly contended (every at-threshold element atomic-
-    // adds into `hist[bin1]`) AND the cache overflow forces a third full
-    // length re-iteration in Pass 3. On degenerate distributions like
-    // uniform-bf16 at L=131k (one giant threshold bin) this regresses
-    // approx well below `topk_v2`. So if the threshold bin is too big to
-    // refine in cache, fall through to the stochastic fast path instead —
-    // recall is comparable to `topk_v2`'s overflow behavior on the same
-    // input, latency stays at one length pass.
-    const int hist_at_tbin0       = hist[tbin0];
-    const int hist_strictly_above = (tbin0 + 1 < RADIX) ? hist[tbin0 + 1] : 0;
-    const int count_at_threshold  = hist_at_tbin0 - hist_strictly_above;
-    const bool degenerate_bin     = count_at_threshold > kApproxSmemInputSize;
-
     // ---------------- Single-pass emit ----------------
-    if (last_remain0 <= tolerate_thresh || degenerate_bin) {
+    // Fast path fires only when the user explicitly opts in via tolerate_thresh.
+    // No degenerate-bin auto-fallback: at α=0 we always run the exact
+    // slow-path refinement, even on degenerate distributions where the
+    // threshold bin overflows the SMEM cache (Pass 3 then re-iterates the
+    // full row to pick up overflow elements). Trading latency for recall
+    // here keeps `approx_topk@0` an honest baseline.
+    if (last_remain0 <= tolerate_thresh) {
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
             const auto bin =
                 (score_to_key32(to_float<ScoreT>(input[idx])) >> 24) & 0xFFu;
