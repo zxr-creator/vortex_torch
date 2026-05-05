@@ -46,14 +46,16 @@ LARGE_INPUT_LENS = [32768, 65536, 131072]
 LARGE_TOPK_VAL = 2048
 
 METHOD_ORDER = [
+    "sort_topk",
     "radix_topk",
     "approx_radix_topk",
     "radix_topk_remap",
     "approx_radix_topk_remap",
 ]
-SPEEDUP_METHOD_ORDER = [m for m in METHOD_ORDER if m != "radix_topk"]
+SPEEDUP_METHOD_ORDER = [m for m in METHOD_ORDER if m != "sort_topk"]
 
 METHOD_LABEL = {
+    "sort_topk": "Sort TopK",
     "radix_topk": "Radix TopK",
     "approx_radix_topk": "Approx Radix TopK",
     "radix_topk_remap": "Radix TopK + Remap",
@@ -62,6 +64,7 @@ METHOD_LABEL = {
 
 # Soft, colorblind-friendly conference-style palette.
 METHOD_COLOR = {
+    "sort_topk": "#9AA7B1",                 # muted slate
     "radix_topk": "#66C2A5",                # soft teal
     "approx_radix_topk": "#FC8D62",         # soft orange
     "radix_topk_remap": "#8DA0CB",          # soft blue-purple

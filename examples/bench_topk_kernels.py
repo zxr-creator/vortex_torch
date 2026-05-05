@@ -373,10 +373,12 @@ def main() -> None:
         # output_view_shape, extra_fields). extra_fields is a dict (or None)
         # of additional record fields used by the *_remap autotuned kernels
         # to surface their chosen mapping_mode / mapping_power.
-        # Baselines: radix_topk (topk_v2) and approx_radix_topk are sufficient
-        # — sort_topk (full-sort) is much slower and not the relevant
-        # comparison point for the remap variants.
+        # All five kernels: sort_topk is the full-sort baseline against
+        # which speedups are measured; radix_topk / approx_radix_topk are
+        # the unmapped fast variants; the *_remap kernels are autotuned.
         kernels: List[tuple] = [
+            ("sort_topk",  lambda: topk_output(*common_args),
+             None, sparse_kv_indices, (eff_batch_size, per_row_sparse), None),
             ("radix_topk", lambda: topk_output_v2(*common_args),
              None, sparse_kv_indices, (eff_batch_size, per_row_sparse), None),
         ]

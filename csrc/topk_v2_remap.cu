@@ -317,6 +317,12 @@ constexpr size_t kSmem = 48 * 1024;
 constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);
 #endif
 
+// Upper bound on dynamic SMEM the slow-path kernel may opt into. Sized to
+// match the per-block opt-in ceiling on Hopper / Blackwell (≤ 100 KB).
+// At launch we use kSmem + bins_bytes when it fits, else dispatch to the
+// uncached kernel.
+constexpr size_t kSmemMax = 96 * 1024;
+
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
     __half h = __float2half_rn(x);
     uint16_t bits = __half_as_ushort(h);
@@ -356,7 +362,12 @@ __device__ __forceinline__ float vortex_to_float<__nv_bfloat16>(__nv_bfloat16 x)
 
 constexpr int VORTEX_MAX_TOPK = 2048;
 
-template <typename ScoreT, int MODE>
+// USE_CACHE: when true, the launcher allocated extra dynamic SMEM after
+// vh_input_idx for s_bins (one byte per element) and Pass 1 caches the
+// Stage-1 bin so Pass 2 skips global re-read + transform re-apply for
+// non-threshold elements. When false (length too large to fit s_bins in
+// the device's opt-in SMEM), Pass 2 re-reads as in the original kernel.
+template <typename ScoreT, int MODE, bool USE_CACHE>
 __device__ void fast_topk_vortex_remap(
     const ScoreT* __restrict__ input,
     int*          __restrict__ index,
@@ -376,7 +387,9 @@ __device__ void fast_topk_vortex_remap(
     alignas(128) __shared__ int vh_num_input[2];
 
     auto& vh_histogram = vh_histogram_buf[0];
+
     extern __shared__ int vh_input_idx[][SMEM_INPUT_SIZE];
+    uint8_t* const s_bins = reinterpret_cast<uint8_t*>(&vh_input_idx[2][0]);
 
     const int tx = threadIdx.x;
 
@@ -387,6 +400,7 @@ __device__ void fast_topk_vortex_remap(
         const float raw    = vortex_to_float(input[idx + row_start]);
         const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
         const auto  bin    = convert_to_uint8(mapped);
+        if constexpr (USE_CACHE) s_bins[idx] = static_cast<uint8_t>(bin);
         ::atomicAdd(&vh_histogram[bin], 1);
     }
     __syncthreads();
@@ -419,11 +433,23 @@ __device__ void fast_topk_vortex_remap(
     const auto threshold_bin = vh_threshold_bin_id;
     topk -= vh_histogram[threshold_bin + 1];
 
-    if (topk == 0) {
-        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    // Helper: byte-0 bin for an element. With USE_CACHE we read the byte
+    // already stored in SMEM during Pass 1; otherwise we re-read raw + re-
+    // apply the transform (the original behavior).
+    auto read_bin = [&] (int idx) -> int {
+        if constexpr (USE_CACHE) {
+            return static_cast<int>(s_bins[idx]);
+        } else {
             const float raw    = vortex_to_float(input[idx + row_start]);
             const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
-            const auto  bin    = static_cast<int>(convert_to_uint8(mapped));
+            return static_cast<int>(convert_to_uint8(mapped));
+        }
+    };
+
+    if (topk == 0) {
+        // Above-threshold shortcut.
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+            const int bin = read_bin(idx);
             if (bin > threshold_bin) {
                 const auto pos = ::atomicAdd(&vh_counter, 1);
                 index[pos] = idx;
@@ -436,20 +462,22 @@ __device__ void fast_topk_vortex_remap(
         if (tx < RADIX + 1) vh_histogram[tx] = 0;
         __syncthreads();
 
+        // Pass 2: gate on bin (cached when available). Above-threshold
+        // emits immediately; at-threshold re-reads raw + re-applies the
+        // transform — only there — to derive the byte-1 sub_bin for
+        // Stage-2 round 0.
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-            // raw_input is the *mapped* float; both the byte-0 bin and the
-            // byte-1 sub_bin must be derived from the same mapped value.
-            const auto raw_input = apply_transform_tmpl<MODE>(
-                vortex_to_float(input[idx + row_start]), mapping_power);
-            const auto bin = static_cast<int>(convert_to_uint8(raw_input));
+            const int bin = read_bin(idx);
             if (bin > threshold_bin) {
                 const auto pos = ::atomicAdd(&vh_counter, 1);
                 index[pos] = idx;
             } else if (bin == threshold_bin) {
+                const float raw    = vortex_to_float(input[idx + row_start]);
+                const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
                 const auto pos = ::atomicAdd(&vh_num_input[0], 1);
                 if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
                     vh_input_idx[0][pos] = idx;
-                    const auto b32 = convert_to_uint32_bits(raw_input);
+                    const auto b32 = convert_to_uint32_bits(mapped);
                     const auto sub_bin = (b32 >> 24) & 0xFF;
                     ::atomicAdd(&vh_histogram[sub_bin], 1);
                 }
@@ -528,7 +556,7 @@ __device__ void fast_topk_vortex_remap(
     }
 }
 
-template <typename ScoreT, int MODE>
+template <typename ScoreT, int MODE, bool USE_CACHE>
 __global__ __launch_bounds__(kThreadsPerBlock)
 void TopKOutputRemap_Kernel(
     const ScoreT* __restrict__ score,
@@ -556,7 +584,8 @@ void TopKOutputRemap_Kernel(
                                          + page_reserved_bos;
 
     __shared__ int s_indices[VORTEX_MAX_TOPK];
-    fast_topk_vortex_remap<ScoreT, MODE>(score_blk, s_indices, 0, nblk, topk_val, mapping_power);
+    fast_topk_vortex_remap<ScoreT, MODE, USE_CACHE>(
+        score_blk, s_indices, 0, nblk, topk_val, mapping_power);
     __syncthreads();
 
     const int tx = threadIdx.x;
@@ -639,18 +668,43 @@ void topk_output_v2_remap(
     dim3 nblks(eff_batch_size);
     dim3 nthreads(kThreadsPerBlock);
 
+    // s_bins occupies one byte per element (max_num_pages elements). Round
+    // up to 16-byte alignment. Use the bin cache only when (kSmem + bins)
+    // fits within the device-opt-in SMEM ceiling; otherwise fall back to
+    // the original kernel which re-reads on every pass.
+    const size_t bins_bytes = (static_cast<size_t>(max_num_pages) + 15) & ~size_t(15);
+    const bool   use_cache  = (kSmem + bins_bytes <= kSmemMax);
+    const size_t launch_smem = use_cache ? (kSmem + bins_bytes) : kSmem;
+
     #define VORTEX_DISPATCH_SLOW(DTYPE, PTR_EXPR, MODE_VAL)                              \
         do {                                                                              \
-            setup_kernel_smem_once<TopKOutputRemap_Kernel<DTYPE, MODE_VAL>, kSmem>();      \
-            TopKOutputRemap_Kernel<DTYPE, MODE_VAL><<<nblks, nthreads, kSmem, stream>>>(   \
-                PTR_EXPR,                                                                 \
-                dense_kv_indptr.data_ptr<int>(),                                          \
-                sparse_kv_indptr.data_ptr<int>(),                                         \
-                dense_kv_indices.data_ptr<int>(),                                         \
-                sparse_kv_indices.data_ptr<int>(),                                        \
-                static_cast<int>(reserved_bos),                                           \
-                static_cast<int>(reserved_eos),                                           \
-                power_exp);                                                               \
+            if (use_cache) {                                                              \
+                setup_kernel_smem_once<                                                   \
+                    TopKOutputRemap_Kernel<DTYPE, MODE_VAL, true>, kSmemMax>();           \
+                TopKOutputRemap_Kernel<DTYPE, MODE_VAL, true>                             \
+                    <<<nblks, nthreads, launch_smem, stream>>>(                           \
+                    PTR_EXPR,                                                             \
+                    dense_kv_indptr.data_ptr<int>(),                                      \
+                    sparse_kv_indptr.data_ptr<int>(),                                     \
+                    dense_kv_indices.data_ptr<int>(),                                     \
+                    sparse_kv_indices.data_ptr<int>(),                                    \
+                    static_cast<int>(reserved_bos),                                       \
+                    static_cast<int>(reserved_eos),                                       \
+                    power_exp);                                                           \
+            } else {                                                                      \
+                setup_kernel_smem_once<                                                   \
+                    TopKOutputRemap_Kernel<DTYPE, MODE_VAL, false>, kSmem>();             \
+                TopKOutputRemap_Kernel<DTYPE, MODE_VAL, false>                            \
+                    <<<nblks, nthreads, kSmem, stream>>>(                                 \
+                    PTR_EXPR,                                                             \
+                    dense_kv_indptr.data_ptr<int>(),                                      \
+                    sparse_kv_indptr.data_ptr<int>(),                                     \
+                    dense_kv_indices.data_ptr<int>(),                                     \
+                    sparse_kv_indices.data_ptr<int>(),                                    \
+                    static_cast<int>(reserved_bos),                                       \
+                    static_cast<int>(reserved_eos),                                       \
+                    power_exp);                                                           \
+            }                                                                             \
         } while (0)
 
     #define VORTEX_DISPATCH_MODE(DTYPE, PTR_EXPR)                                         \
