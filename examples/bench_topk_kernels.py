@@ -426,12 +426,15 @@ def main() -> None:
         # alongside the unmapped kernels for an apples-to-apples comparison.
         # Skipped entirely when the C extension wasn't built with remap.
         if HAS_REMAP:
-            # Approx remap autotune sweeps both the mapping AND the
-            # tolerate_ratio so it can pick combinations like
-            # (HALF_SQUARE, α=0.5) where the remap shrinks the threshold
-            # bin enough that the kernel's Pass-2-fast branch fires while
-            # recall stays ≥ 0.99.
-            approx_remap_factory = lambda mode, power, tol: (
+            # Approx remap: autotune ONLY the mapping (use a fixed probe
+            # α=0.0 during autotune so we compare mappings on equal terms).
+            # After picking the mapping, bench it at every α in
+            # `tolerate_ratios` as separate rows — same shape as how the
+            # unmapped approx is benched at every α.
+            approx_remap_probe_factory = lambda mode, power: (
+                lambda: approx_topk_output_remap(*common_args, 0.0, mode, power)
+            )
+            approx_remap_run_factory = lambda mode, power, tol: (
                 lambda: approx_topk_output_remap(*common_args, tol, mode, power)
             )
             topkv2_remap_factory = lambda mode, power: (
@@ -439,11 +442,10 @@ def main() -> None:
             )
 
             approx_chosen = autotune_remap(
-                approx_remap_factory, sparse_kv_indices,
+                approx_remap_probe_factory, sparse_kv_indices,
                 (eff_batch_size, per_row_sparse),
                 x, eff_batch_size, blocks_per_row, topk_val,
                 args.reserved_bos, args.reserved_eos,
-                tolerate_ratios=AUTOTUNE_APPROX_TOLERATE_RATIOS,
             )
             topkv2_chosen = autotune_remap(
                 topkv2_remap_factory, sparse_kv_indices,
@@ -452,18 +454,19 @@ def main() -> None:
                 args.reserved_bos, args.reserved_eos,
             )
 
-            kernels.append((
-                f"approx_radix_topk_remap@{approx_chosen['tag']}",
-                approx_remap_factory(approx_chosen["mapping_mode"],
-                                     approx_chosen["mapping_power"],
-                                     approx_chosen["tolerate_ratio"]),
-                approx_chosen["tolerate_ratio"],
-                sparse_kv_indices, (eff_batch_size, per_row_sparse),
-                {"mapping_mode":  approx_chosen["mapping_mode"],
-                 "mapping_power": approx_chosen["mapping_power"],
-                 "mapping_tag":   approx_chosen.get("mapping_tag", approx_chosen["tag"]),
-                 "autotune_baseline_recall_at_topk": approx_chosen["baseline_recall_at_topk"]},
-            ))
+            for tr_local in tolerate_ratios:
+                tr_capture = tr_local
+                kernels.append((
+                    f"approx_radix_topk_remap@{approx_chosen['tag']}@{tr_capture:g}",
+                    approx_remap_run_factory(approx_chosen["mapping_mode"],
+                                             approx_chosen["mapping_power"],
+                                             tr_capture),
+                    tr_capture, sparse_kv_indices, (eff_batch_size, per_row_sparse),
+                    {"mapping_mode":  approx_chosen["mapping_mode"],
+                     "mapping_power": approx_chosen["mapping_power"],
+                     "mapping_tag":   approx_chosen.get("mapping_tag", approx_chosen["tag"]),
+                     "autotune_baseline_recall_at_topk": approx_chosen["baseline_recall_at_topk"]},
+                ))
             kernels.append((
                 f"radix_topk_remap@{topkv2_chosen['tag']}",
                 topkv2_remap_factory(topkv2_chosen["mapping_mode"],

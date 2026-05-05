@@ -315,8 +315,8 @@ constexpr int VORTEX_MAX_TOPK = 2048;
 //   - RTX PRO 6000 / Blackwell SM_120 : 99 KB  → use 96 KB
 //   - H100 / H200      / Hopper  SM_90 : 228 KB → use 224 KB
 // Switch the active line to match the deployment arch.
-constexpr size_t kApproxRemapSmemMax = 80  * 1024;   // RTX PRO 6000 (Blackwell SM_120, ~99 KB opt-in − ~11 KB static)
-// constexpr size_t kApproxRemapSmemMax = 200 * 1024;   // H100 / H200 (Hopper SM_90, 228 KB opt-in)
+constexpr size_t kApproxRemapSmemMax = 88  * 1024;   // RTX PRO 6000 (Blackwell SM_120, ~99 KB opt-in − ~11 KB static)
+// constexpr size_t kApproxRemapSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90, 228 KB opt-in)
 
 template <auto* f, size_t max_dynamic_smem>
 void approx_setup_kernel_smem_once() {
@@ -366,7 +366,7 @@ __device__ __forceinline__ uint32_t score_to_key32(float x) {
 // 2-passes + bounded-refinement scaling. If the at-threshold subset
 // overflows SMEM, the kernel falls back to the original full-length
 // re-iteration for correctness.
-constexpr int kApproxRemapSmemInputSize = 4096;
+constexpr int kApproxRemapSmemInputSize = 16384;
 
 template <typename ScoreT, int MODE>
 __device__ void approx_topk_remap_inner(
@@ -431,7 +431,16 @@ __device__ void approx_topk_remap_inner(
     const int tbin0        = s_threshold_bin;
     const int last_remain0 = s_last_remain;
 
-    if (last_remain0 <= tolerate_thresh) {
+    // Degenerate-bin guard (same reasoning as approx_topk.cu): if the
+    // threshold bin is bigger than the at-threshold SMEM cache, take the
+    // stochastic fast path instead of paying for the slow path's full
+    // re-iteration + heavy sub-bin atomicAdd contention.
+    const int hist_at_tbin0       = hist[tbin0];
+    const int hist_strictly_above = (tbin0 + 1 < RADIX) ? hist[tbin0 + 1] : 0;
+    const int count_at_threshold  = hist_at_tbin0 - hist_strictly_above;
+    const bool degenerate_bin     = count_at_threshold > kApproxRemapSmemInputSize;
+
+    if (last_remain0 <= tolerate_thresh || degenerate_bin) {
         // Early-termination: 1 pass over length, no Stage-2 refinement.
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
             const float raw    = to_float<ScoreT>(input[idx]);

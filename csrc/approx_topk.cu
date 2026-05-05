@@ -361,8 +361,25 @@ __device__ __forceinline__ uint32_t score_to_key32(float x) {
 
 
 // At-threshold-bin index cache size for the slow-path Stage-2 refinement.
+// Sized to comfortably hold the threshold bin even for skewed distributions
+// (bimodal, uniform-in-bf16) at length=131072 — empirically the threshold
+// bin grows up to ~10k elements there. 16384 ints = 64 KB SMEM, which
+// fits inside the per-block opt-in ceiling on every supported arch.
 // Must equal kApproxRemapSmemInputSize (see approx_topk_remap.cu).
-constexpr int kApproxSmemInputSize = 4096;
+constexpr int kApproxSmemInputSize = 16384;
+
+template <auto* f, size_t max_dynamic_smem>
+void approx_setup_kernel_smem_once_local() {
+    [[maybe_unused]]
+    static const auto result = ::cudaFuncSetAttribute(
+        f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+    TORCH_CHECK(result == cudaSuccess,
+                "approx_topk setup_kernel_smem_once failed: ",
+                ::cudaGetErrorString(result));
+}
+
+constexpr size_t kApproxSmemMax = 88 * 1024;   // RTX PRO 6000 (Blackwell SM_120)
+// constexpr size_t kApproxSmemMax = 224 * 1024;   // H100 / H200 (Hopper SM_90)
 
 template <typename ScoreT>
 __device__ void approx_topk_inner(
@@ -424,8 +441,24 @@ __device__ void approx_topk_inner(
     const int tbin0        = s_threshold_bin;
     const int last_remain0 = s_last_remain;
 
+    // hist[] currently holds the descending suffix sum, so the size of the
+    // threshold bin itself is `hist[tbin0] - hist[tbin0+1]`. When that
+    // count exceeds the at-threshold cache, the slow-path's Stage-2 sub-bin
+    // histogram becomes badly contended (every at-threshold element atomic-
+    // adds into `hist[bin1]`) AND the cache overflow forces a third full
+    // length re-iteration in Pass 3. On degenerate distributions like
+    // uniform-bf16 at L=131k (one giant threshold bin) this regresses
+    // approx well below `topk_v2`. So if the threshold bin is too big to
+    // refine in cache, fall through to the stochastic fast path instead —
+    // recall is comparable to `topk_v2`'s overflow behavior on the same
+    // input, latency stays at one length pass.
+    const int hist_at_tbin0       = hist[tbin0];
+    const int hist_strictly_above = (tbin0 + 1 < RADIX) ? hist[tbin0 + 1] : 0;
+    const int count_at_threshold  = hist_at_tbin0 - hist_strictly_above;
+    const bool degenerate_bin     = count_at_threshold > kApproxSmemInputSize;
+
     // ---------------- Single-pass emit ----------------
-    if (last_remain0 <= tolerate_thresh) {
+    if (last_remain0 <= tolerate_thresh || degenerate_bin) {
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
             const auto bin =
                 (score_to_key32(to_float<ScoreT>(input[idx])) >> 24) & 0xFFu;
@@ -628,12 +661,16 @@ void approx_topk_output(
 
     const float tol = static_cast<float>(tolerate_ratio);
 
-    // Dynamic SMEM caches at-threshold-bin indices (16 KB) so Stage-2 only
+    // Dynamic SMEM caches at-threshold-bin indices (64 KB) so Stage-2 only
     // iterates that subset, matching the topk_v2 slow-path scaling.
     constexpr size_t kApproxSmemBytes =
         static_cast<size_t>(kApproxSmemInputSize) * sizeof(int);
+    static_assert(kApproxSmemBytes <= kApproxSmemMax,
+                  "approx at-threshold cache exceeds opt-in SMEM ceiling");
 
     if (x.scalar_type() == at::ScalarType::BFloat16) {
+        approx_setup_kernel_smem_once_local<
+            ApproxTopK_Kernel<__nv_bfloat16>, kApproxSmemMax>();
         ApproxTopK_Kernel<__nv_bfloat16>
             <<<nblks, nthreads, kApproxSmemBytes, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
@@ -645,6 +682,8 @@ void approx_topk_output(
             static_cast<int>(reserved_eos),
             tol);
     } else if (x.scalar_type() == at::ScalarType::Float) {
+        approx_setup_kernel_smem_once_local<
+            ApproxTopK_Kernel<float>, kApproxSmemMax>();
         ApproxTopK_Kernel<float>
             <<<nblks, nthreads, kApproxSmemBytes, stream>>>(
             x.data_ptr<float>(),
