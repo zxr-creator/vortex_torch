@@ -1,36 +1,38 @@
-"""Plot top-k kernel benchmark results (32k inputs only).
+"""Plot top-k kernel latency for a top-ML-conference figure.
 
-Inputs : topk_bench_20260505_075252.csv
-Outputs:
-    topk_speedup.pdf    Speedup of v2 / approx (and remap variants) over the
-                        two baselines, broken down by k, distribution, model.
-    topk_correctness.pdf Recall comparison and per-config recall vs latency.
+A 2 x 4 grid of subfigures, single PDF:
+  Row 1 (top)    : short context  (2k)   — one column per distribution
+  Row 2 (bottom) : long context   (128k) — one column per distribution
 
-Baselines: topk_output (full-sort) and topk_output_sglang_ori (SGLang).
-Best-of  : per-config minimum-latency variant inside each kernel family
-           (best alpha for approx, best mapping for *_remap).
+Distributions: bimodal / normal / real / uniform.
+Each subfigure: grouped bars where x = model size and groups = sparse
+top-k algorithm family. Per-config best variant (min mean_ms across
+mapping / tolerate-ratio variants). No error bars.
 """
 
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-CSV = Path("/data/datasets/xinrui/topk_bench_20260505_075252.csv")
+CSV = Path("/data/datasets/xinrui/My_Projects/v0.3/vortex_torch/examples/topk_bench_20260505_215943.csv")
 OUT = Path("/data/datasets/xinrui/topk_kernels.pdf")
+
+LOW_LABEL  = "2k"
+LONG_LABEL = "128k"
 
 # ----- conference-quality matplotlib defaults --------------------------------
 mpl.rcParams.update({
     "font.family"      : "serif",
     "font.serif"       : ["Times New Roman", "Times", "DejaVu Serif"],
-    "font.size"        : 9.5,
-    "axes.titlesize"   : 10.5,
-    "axes.labelsize"   : 10,
-    "xtick.labelsize"  : 9,
-    "ytick.labelsize"  : 9,
-    "legend.fontsize"  : 8.5,
+    "font.size"        : 9.0,
+    "axes.titlesize"   : 10,
+    "axes.labelsize"   : 9.5,
+    "xtick.labelsize"  : 8.5,
+    "ytick.labelsize"  : 8.5,
+    "legend.fontsize"  : 8.8,
     "axes.linewidth"   : 0.8,
     "axes.spines.top"  : False,
     "axes.spines.right": False,
@@ -38,201 +40,148 @@ mpl.rcParams.update({
     "ps.fonttype"      : 42,
 })
 
-KEY = ["model", "batch_size", "distribution", "input_label", "input_len",
-       "blocks_per_row", "topk_val"]
 
-KERNEL_ORDER = ["topk_output_v2", "topk_output_v2_remap",
-                "approx_topk_output", "approx_topk_output_remap"]
-KERNEL_LABEL = {
-    "topk_output_v2"          : r"$\mathtt{topk\_v2}$",
-    "topk_output_v2_remap"    : r"$\mathtt{topk\_v2}$ + remap",
-    "approx_topk_output"      : r"$\mathtt{approx\_topk}$",
-    "approx_topk_output_remap": r"$\mathtt{approx\_topk}$ + remap",
+# ----- kernel family taxonomy ------------------------------------------------
+def family_of(kernel: str) -> str:
+    if kernel == "sort_topk":
+        return "sort_topk"
+    if kernel.startswith("approx_radix_topk_remap"):
+        return "approx_radix_topk_remap"
+    if kernel.startswith("approx_radix_topk"):
+        return "approx_radix_topk"
+    if kernel.startswith("radix_topk_remap"):
+        return "radix_topk_remap"
+    if kernel == "radix_topk":
+        return "radix_topk"
+    return "other"
+
+
+FAMILY_ORDER = [
+    "radix_topk",
+    "radix_topk_remap",
+    "approx_radix_topk",
+    "approx_radix_topk_remap",
+]
+FAMILY_LABEL = {
+    "radix_topk"              : r"$\mathtt{radix\_topk}$",
+    "radix_topk_remap"        : r"$\mathtt{radix\_topk}$ + remap",
+    "approx_radix_topk"       : r"$\mathtt{approx\_radix\_topk}$",
+    "approx_radix_topk_remap" : r"$\mathtt{approx\_radix\_topk}$ + remap",
 }
-# colorblind-safe palette (Okabe-Ito inspired)
-KERNEL_COLOR = {
-    "topk_output_v2"          : "#0072B2",   # blue
-    "topk_output_v2_remap"    : "#56B4E9",   # light blue
-    "approx_topk_output"      : "#D55E00",   # vermilion
-    "approx_topk_output_remap": "#F0A270",   # light vermilion
+
+# Soft pastel palette inspired by the supplied reference figure.
+FAMILY_COLOR = {
+    "radix_topk"              : "#F2B07A",  # soft peach
+    "radix_topk_remap"        : "#E89AAE",  # blush pink
+    "approx_radix_topk"       : "#9CC6A8",  # sage green
+    "approx_radix_topk_remap" : "#C5A6D6",  # soft lavender
 }
-BASELINE_COLOR = {
-    "topk_output"           : "#555555",
-    "topk_output_sglang_ori": "#999999",
-}
+
+MODEL_ORDER = ["qwen3_0p6b", "qwen3_1p7b", "qwen3_4b", "qwen3_8b"]
 MODEL_LABEL = {
     "qwen3_0p6b": "0.6B",
     "qwen3_1p7b": "1.7B",
     "qwen3_4b"  : "4B",
     "qwen3_8b"  : "8B",
 }
+
+DIST_ORDER = ["bimodal", "normal", "real", "uniform"]
 DIST_LABEL = {
-    "uniform": "uniform",
-    "normal" : "normal",
     "bimodal": "bimodal",
+    "normal" : "normal",
     "real"   : "real",
+    "uniform": "uniform",
 }
 
 
 def load() -> pd.DataFrame:
     df = pd.read_csv(CSV)
-    df["kernel_base"] = df["kernel"].str.replace(r"@.*$", "", regex=True)
-    return df[df["input_label"] == "32k"].copy()
+    df["family"] = df["kernel"].map(family_of)
+    return df[df["input_label"].isin([LOW_LABEL, LONG_LABEL])].copy()
 
 
-def make_pivot(df: pd.DataFrame) -> pd.DataFrame:
-    best = (df.groupby(KEY + ["kernel_base"])["mean_ms"]
-              .min().reset_index())
-    return best.pivot_table(index=KEY, columns="kernel_base",
-                            values="mean_ms").reset_index()
+def latency_table(df: pd.DataFrame, input_label: str,
+                  distribution: str) -> pd.DataFrame:
+    """(model x family) latency table in ms for one (input_label, distribution).
+
+    Per (model, family) we take the best (min mean_ms) across mapping /
+    tolerate-ratio variants — no averaging across distributions.
+    """
+    sub = df[(df["input_label"] == input_label)
+             & (df["distribution"] == distribution)]
+    best = (sub.groupby(["model", "family"])["mean_ms"]
+               .min()
+               .reset_index())
+    pv = best.pivot(index="model", columns="family", values="mean_ms")
+    return pv.reindex(index=MODEL_ORDER, columns=FAMILY_ORDER)
 
 
-def add_speedups(pv: pd.DataFrame) -> pd.DataFrame:
-    for k in KERNEL_ORDER:
-        pv[f"spd_{k}_vs_full"] = pv["topk_output"] / pv[k]
-        pv[f"spd_{k}_vs_sg"]   = pv["topk_output_sglang_ori"] / pv[k]
-    return pv
+def draw_panel(ax, pv: pd.DataFrame, title: str, ylabel_show: bool,
+               xlabel_show: bool) -> None:
+    n_fam   = len(FAMILY_ORDER)
+    n_model = len(MODEL_ORDER)
+    width   = 0.84 / n_fam
+    x       = np.arange(n_model)
+
+    for i, fam in enumerate(FAMILY_ORDER):
+        vals = pv[fam].values
+        offset = (i - (n_fam - 1) / 2) * width
+        ax.bar(x + offset, vals, width,
+               color=FAMILY_COLOR[fam],
+               edgecolor="#404040", linewidth=0.5,
+               label=FAMILY_LABEL[fam])
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_LABEL[m] for m in MODEL_ORDER])
+    if xlabel_show:
+        ax.set_xlabel("Model size")
+    if ylabel_show:
+        ax.set_ylabel("Latency (ms)")
+    ax.set_title(title)
+    ax.grid(axis="y", lw=0.3, alpha=0.55)
+    ax.set_axisbelow(True)
+    ymax = np.nanmax(pv.values)
+    ax.set_ylim(0, ymax * 1.18)
 
 
-# ============================================================================
-# Single combined figure: 2 x 2 panels (speedup top, correctness bottom)
-# ============================================================================
-def fig_combined(df: pd.DataFrame, pv: pd.DataFrame) -> None:
-    fig = plt.figure(figsize=(17, 3.6))
-    gs  = fig.add_gridspec(1, 4, width_ratios=[1.7, 0.9, 1.7, 1.3],
-                           wspace=0.34)
-    ax_a = fig.add_subplot(gs[0, 0])
-    ax_b = fig.add_subplot(gs[0, 1])
-    ax_c = fig.add_subplot(gs[0, 2])
-    ax_d = fig.add_subplot(gs[0, 3])
+def fig_grid(df: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(2, 4, figsize=(13.5, 5.6),
+                             gridspec_kw={"wspace": 0.30, "hspace": 0.42})
 
-    # --- (a) speedup vs topk_output, by k --------------------------------
-    topk_vals = sorted(pv["topk_val"].unique())
-    width     = 0.19
-    x         = np.arange(len(topk_vals))
-    for i, k in enumerate(KERNEL_ORDER):
-        means = [pv[pv["topk_val"] == kv][f"spd_{k}_vs_full"].mean()
-                 for kv in topk_vals]
-        stds  = [pv[pv["topk_val"] == kv][f"spd_{k}_vs_full"].std()
-                 for kv in topk_vals]
-        ax_a.bar(x + (i - 1.5) * width, means, width,
-                 yerr=stds, capsize=2,
-                 label=KERNEL_LABEL[k], color=KERNEL_COLOR[k],
-                 edgecolor="black", linewidth=0.4)
-    ax_a.axhline(1.0, color="gray", lw=0.8, ls="--")
-    ax_a.set_xticks(x)
-    ax_a.set_xticklabels([f"$k$={kv}" for kv in topk_vals])
-    ax_a.set_xlabel("Number of selected blocks")
-    ax_a.set_ylabel(r"Speedup vs $\mathtt{topk\_output}$ ($\times$)")
-    ax_a.set_title(r"(a) Speedup vs $\mathtt{topk\_output}$ (full-sort)")
-    ax_a.set_ylim(0, 2.15)
-    ax_a.grid(axis="y", lw=0.3, alpha=0.5)
-    ax_a.legend(ncol=2, loc="upper right", framealpha=0.9,
-                handlelength=1.6, columnspacing=1.0)
+    rows = [(LOW_LABEL,  "Short context (2k)"),
+            (LONG_LABEL, "Long context (128k)")]
 
-    # --- (b) speedup vs SGLang at k=32 -----------------------------------
-    sub = pv[pv["topk_output_sglang_ori"].notna()]
-    means = [sub[f"spd_{k}_vs_sg"].mean() for k in KERNEL_ORDER]
-    stds  = [sub[f"spd_{k}_vs_sg"].std()  for k in KERNEL_ORDER]
-    bx    = np.arange(len(KERNEL_ORDER))
-    bars  = ax_b.bar(bx, means, yerr=stds, capsize=2,
-                     color=[KERNEL_COLOR[k] for k in KERNEL_ORDER],
-                     edgecolor="black", linewidth=0.4)
-    for r, v in zip(bars, means):
-        ax_b.text(r.get_x() + r.get_width() / 2, v + 0.06,
-                  f"{v:.2f}$\\times$", ha="center", fontsize=8.5)
-    ax_b.axhline(1.0, color="gray", lw=0.8, ls="--")
-    ax_b.set_xticks(bx)
-    ax_b.set_xticklabels(["v2", "v2+R", "approx", "approx+R"], rotation=15)
-    ax_b.set_ylabel(r"Speedup vs SGLang ($\times$)")
-    ax_b.set_title(r"(b) vs $\mathtt{sglang\_ori}$, $k$=32")
-    ax_b.set_ylim(0, max(means) * 1.35)
-    ax_b.grid(axis="y", lw=0.3, alpha=0.5)
+    for r, (input_label, ctx_name) in enumerate(rows):
+        for c, dist in enumerate(DIST_ORDER):
+            ax = axes[r, c]
+            pv = latency_table(df, input_label, dist)
+            tag = chr(ord('a') + r * 4 + c)  # a..h
+            title = f"({tag}) {ctx_name} – {DIST_LABEL[dist]}"
+            draw_panel(ax, pv, title,
+                       ylabel_show=(c == 0),
+                       xlabel_show=(r == 1))
 
-    # --- best variant per (config, kernel_base) for recall panels --------
-    best_idx = df.groupby(KEY + ["kernel_base"])["mean_ms"].idxmin()
-    best = df.loc[best_idx]
-
-    # --- (c) recall by kernel and k --------------------------------------
-    kernels  = ["topk_output", "topk_output_sglang_ori"] + KERNEL_ORDER
-    palette  = {**KERNEL_COLOR, **BASELINE_COLOR}
-    pretty   = {**KERNEL_LABEL,
-                "topk_output"           : r"$\mathtt{topk\_output}$",
-                "topk_output_sglang_ori": r"$\mathtt{sglang\_ori}$"}
-    width = 0.13
-    x     = np.arange(len(topk_vals))
-    for i, k in enumerate(kernels):
-        means = []
-        for kv in topk_vals:
-            s = best[(best["kernel_base"] == k) & (best["topk_val"] == kv)]
-            means.append(s["recall_at_topk"].mean() if len(s) else np.nan)
-        ax_c.bar(x + (i - len(kernels) / 2 + 0.5) * width, means, width,
-                 label=pretty[k], color=palette[k],
-                 edgecolor="black", linewidth=0.4)
-    ax_c.set_xticks(x)
-    ax_c.set_xticklabels([f"$k$={kv}" for kv in topk_vals])
-    ax_c.set_xlabel("Number of selected blocks")
-    ax_c.set_ylabel("Mean recall @ top-$k$")
-    ax_c.set_ylim(0, 1.05)
-    ax_c.set_title("(c) Recall (SGLang $\\approx$ 0)")
-    ax_c.legend(ncol=2, loc="lower right", framealpha=0.9,
-                handlelength=1.2, columnspacing=0.8, fontsize=7)
-    ax_c.grid(axis="y", lw=0.3, alpha=0.5)
-
-    # --- (d) latency vs recall scatter (zoomed Pareto) -------------------
-    for k in KERNEL_ORDER:
-        s = best[best["kernel_base"] == k]
-        ax_d.scatter(s["mean_ms"] * 1000.0, s["recall_at_topk"],
-                     s=28, alpha=0.85, color=KERNEL_COLOR[k],
-                     edgecolor="black", linewidth=0.3,
-                     label=KERNEL_LABEL[k])
-    bsub = best[best["kernel_base"] == "topk_output"]
-    ax_d.scatter(bsub["mean_ms"] * 1000.0, bsub["recall_at_topk"],
-                 s=40, marker="X",
-                 color=BASELINE_COLOR["topk_output"],
-                 edgecolor="black", linewidth=0.3,
-                 label=r"$\mathtt{topk\_output}$")
-    ax_d.annotate("", xy=(22.5, 1.001), xytext=(33, 0.985),
-                  arrowprops=dict(arrowstyle="->", color="gray", lw=1.0))
-    ax_d.text(22.7, 1.002, "better", color="gray", fontsize=8.5)
-    ax_d.set_xlabel(r"Latency ($\mu$s)")
-    ax_d.set_ylabel("Recall @ top-$k$")
-    ax_d.set_title("(d) Latency--recall (zoomed)")
-    ax_d.set_ylim(0.974, 1.005)
-    ax_d.grid(lw=0.3, alpha=0.5)
-    ax_d.legend(loc="lower left", framealpha=0.9, handlelength=1.2,
-                fontsize=7.5)
+    # Single shared legend at the top.
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels,
+               loc="upper center", bbox_to_anchor=(0.5, 1.02),
+               ncol=len(FAMILY_ORDER),
+               frameon=False, handlelength=1.6, columnspacing=1.4)
 
     fig.savefig(OUT, bbox_inches="tight")
     print(f"wrote {OUT}")
 
-
-# ============================================================================
-def summary(pv: pd.DataFrame) -> None:
-    print("\n=== speedup vs topk_output (full-sort) ===")
-    for k in KERNEL_ORDER:
-        s = pv[f"spd_{k}_vs_full"]
-        print(f"{k:30s}  mean={s.mean():.2f}x  median={s.median():.2f}x  "
-              f"min={s.min():.2f}x  max={s.max():.2f}x")
-    print("\n=== speedup vs sglang_ori (k=32) ===")
-    sub = pv[pv["topk_output_sglang_ori"].notna()]
-    for k in KERNEL_ORDER:
-        s = sub[f"spd_{k}_vs_sg"]
-        print(f"{k:30s}  mean={s.mean():.2f}x  min={s.min():.2f}x  "
-              f"max={s.max():.2f}x")
-    print("\n=== mean speedup per topk_val ===")
-    print(pv.groupby("topk_val")[
-        [f"spd_{k}_vs_full" for k in KERNEL_ORDER]].mean().round(3))
-    print("\n=== mean speedup per distribution ===")
-    print(pv.groupby("distribution")[
-        [f"spd_{k}_vs_full" for k in KERNEL_ORDER]].mean().round(3))
+    # Dump the underlying numbers for the paper text.
+    for input_label, ctx_name in rows:
+        for dist in DIST_ORDER:
+            pv = latency_table(df, input_label, dist)
+            print(f"\n=== latency (ms), {ctx_name}, distribution={dist} ===")
+            print(pv.round(4))
 
 
 def main() -> None:
     df = load()
-    pv = add_speedups(make_pivot(df))
-    fig_combined(df, pv)
-    summary(pv)
+    fig_grid(df)
 
 
 if __name__ == "__main__":

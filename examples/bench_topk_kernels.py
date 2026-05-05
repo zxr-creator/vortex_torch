@@ -277,8 +277,17 @@ def autotune_remap(
     sweep_tol = tolerate_ratios is not None
     tol_grid = list(tolerate_ratios) if sweep_tol else [float("nan")]
 
+    # Internal-only NONE probe so the autotune can fall back to identity-
+    # transform (≡ baseline) when no real mapping in REMAP_CANDIDATES beats
+    # the unmapped baseline at the current config. This avoids the case
+    # where v2_remap is slower than v2 simply because the autotune was
+    # forced to pick a non-trivial mapping that adds transform overhead
+    # without shrinking the threshold bin (e.g., uniform-bf16 at L=131k).
+    # Tag is "NONE" so the bench output records it as *_remap@NONE.
+    candidates = [("NONE", 0, 0.0)] + list(REMAP_CANDIDATES)
+
     candidate_results = []  # list of (tag_full, tag, mode, power, tol, ms, recall)
-    for tag, mode, power in REMAP_CANDIDATES:
+    for tag, mode, power in candidates:
         for tol in tol_grid:
             fn = (kernel_factory(mode, power, tol) if sweep_tol
                   else kernel_factory(mode, power))
