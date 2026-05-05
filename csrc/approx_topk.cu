@@ -360,6 +360,10 @@ __device__ __forceinline__ uint32_t score_to_key32(float x) {
 }
 
 
+// At-threshold-bin index cache size for the slow-path Stage-2 refinement.
+// Must equal kApproxRemapSmemInputSize (see approx_topk_remap.cu).
+constexpr int kApproxSmemInputSize = 4096;
+
 template <typename ScoreT>
 __device__ void approx_topk_inner(
     const ScoreT* __restrict__ input,
@@ -374,6 +378,9 @@ __device__ void approx_topk_inner(
     alignas(128) __shared__ int s_threshold_bin;
     alignas(128) __shared__ int s_counter;        // strict-winner write head
     alignas(128) __shared__ int s_last_remain;    // atomic-arrival countdown
+    alignas(128) __shared__ int s_at_threshold_count;
+
+    extern __shared__ int s_at_threshold_idx[];   // [kApproxSmemInputSize]
 
     auto& hist = hist_buf[0];
     const int tx = threadIdx.x;
@@ -395,6 +402,7 @@ __device__ void approx_topk_inner(
 
     // ---------------- Pass 1: histogram on byte 0 ----------------
     if (tx < RADIX + 1) hist[tx] = 0;
+    if (tx == 0) s_at_threshold_count = 0;
     __syncthreads();
 
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -436,6 +444,8 @@ __device__ void approx_topk_inner(
     }
 
     // ---------------- Pass 2: emit byte-0 strict + byte-1 sub-histogram ----------------
+    // Cache at-threshold-bin indices in dynamic SMEM so Pass 3 only iterates
+    // that subset (typically O(length/256)) instead of the full row again.
     if (tx < RADIX + 1) hist[tx] = 0;
     __syncthreads();
 
@@ -448,6 +458,10 @@ __device__ void approx_topk_inner(
         } else if (bin0 == tbin0) {
             const auto bin1 = (key32 >> 16) & 0xFFu;
             ::atomicAdd(&hist[bin1], 1);
+            const int slot = ::atomicAdd(&s_at_threshold_count, 1);
+            if (slot < kApproxSmemInputSize) {
+                s_at_threshold_idx[slot] = idx;
+            }
         }
     }
     __syncthreads();
@@ -461,21 +475,41 @@ __device__ void approx_topk_inner(
     }
     __syncthreads();
 
-    const int tbin1 = s_threshold_bin;
+    const int tbin1     = s_threshold_bin;
+    const int at_thresh = s_at_threshold_count;
 
-    // ---------------- Pass 3: byte-1 strict + atomic-arrival ----------------
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-        const auto key32 = score_to_key32(to_float<ScoreT>(input[idx]));
-        const auto bin0  = (key32 >> 24) & 0xFFu;
-        if (bin0 != tbin0) continue;
-        const auto bin1 = (key32 >> 16) & 0xFFu;
-        if (bin1 > tbin1) {
-            const int pos = ::atomicAdd(&s_counter, 1);
-            index[pos] = idx;
-        } else if (bin1 == tbin1) {
-            const int pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-                index[target_k - pos] = idx;
+    if (at_thresh <= kApproxSmemInputSize) {
+        // ---------------- Pass 3: only iterate cached at-threshold subset ----------------
+        for (int i = tx; i < at_thresh; i += BLOCK_SIZE) {
+            const int idx = s_at_threshold_idx[i];
+            const auto key32 = score_to_key32(to_float<ScoreT>(input[idx]));
+            const auto bin1 = (key32 >> 16) & 0xFFu;
+            if (bin1 > tbin1) {
+                const int pos = ::atomicAdd(&s_counter, 1);
+                index[pos] = idx;
+            } else if (bin1 == tbin1) {
+                const int pos = ::atomicAdd(&s_last_remain, -1);
+                if (pos > 0) {
+                    index[target_k - pos] = idx;
+                }
+            }
+        }
+    } else {
+        // Overflow: at-threshold-bin count exceeded SMEM cache; re-iterate
+        // the full length (original Pass 3 behavior).
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+            const auto key32 = score_to_key32(to_float<ScoreT>(input[idx]));
+            const auto bin0  = (key32 >> 24) & 0xFFu;
+            if (bin0 != tbin0) continue;
+            const auto bin1 = (key32 >> 16) & 0xFFu;
+            if (bin1 > tbin1) {
+                const int pos = ::atomicAdd(&s_counter, 1);
+                index[pos] = idx;
+            } else if (bin1 == tbin1) {
+                const int pos = ::atomicAdd(&s_last_remain, -1);
+                if (pos > 0) {
+                    index[target_k - pos] = idx;
+                }
             }
         }
     }
@@ -594,8 +628,14 @@ void approx_topk_output(
 
     const float tol = static_cast<float>(tolerate_ratio);
 
+    // Dynamic SMEM caches at-threshold-bin indices (16 KB) so Stage-2 only
+    // iterates that subset, matching the topk_v2 slow-path scaling.
+    constexpr size_t kApproxSmemBytes =
+        static_cast<size_t>(kApproxSmemInputSize) * sizeof(int);
+
     if (x.scalar_type() == at::ScalarType::BFloat16) {
-        ApproxTopK_Kernel<__nv_bfloat16><<<nblks, nthreads, 0, stream>>>(
+        ApproxTopK_Kernel<__nv_bfloat16>
+            <<<nblks, nthreads, kApproxSmemBytes, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
@@ -605,7 +645,8 @@ void approx_topk_output(
             static_cast<int>(reserved_eos),
             tol);
     } else if (x.scalar_type() == at::ScalarType::Float) {
-        ApproxTopK_Kernel<float><<<nblks, nthreads, 0, stream>>>(
+        ApproxTopK_Kernel<float>
+            <<<nblks, nthreads, kApproxSmemBytes, stream>>>(
             x.data_ptr<float>(),
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),

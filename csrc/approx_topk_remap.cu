@@ -353,13 +353,22 @@ __device__ __forceinline__ uint32_t score_to_key32(float x) {
 }
 
 
-// USE_CACHE: when true, the launcher allocated dynamic SMEM for s_bins
-// (one byte per element) and Pass 1 caches each element's Stage-1 bin so
-// subsequent passes skip the global re-read and transform re-apply. When
-// false (length too large to fit s_bins in opt-in SMEM), the kernel falls
-// back to the original re-read pattern. The compiler emits two
-// specializations and keeps each branch zero-overhead.
-template <typename ScoreT, int MODE, bool USE_CACHE>
+// Approx-radix top-k with at-threshold index caching.
+//
+// Original kernel ran 3 full passes over `length` (Pass 1 histogram,
+// Pass 2 sub-bin histogram, Stage-2 refinement). At long inputs the third
+// pass dominated, making approx slower than the exact radix kernel which
+// has only 2 length-passes plus bounded refinement.
+//
+// This version caches the at-threshold-bin indices in dynamic SMEM during
+// Pass 2; the Stage-2 refinement then iterates only the cached subset
+// (≤ SMEM_INPUT_SIZE = 4096 entries), matching the radix kernel's
+// 2-passes + bounded-refinement scaling. If the at-threshold subset
+// overflows SMEM, the kernel falls back to the original full-length
+// re-iteration for correctness.
+constexpr int kApproxRemapSmemInputSize = 4096;
+
+template <typename ScoreT, int MODE>
 __device__ void approx_topk_remap_inner(
     const ScoreT* __restrict__ input,
     int*          __restrict__ index,
@@ -374,8 +383,11 @@ __device__ void approx_topk_remap_inner(
     alignas(128) __shared__ int s_threshold_bin;
     alignas(128) __shared__ int s_counter;
     alignas(128) __shared__ int s_last_remain;
+    alignas(128) __shared__ int s_at_threshold_count;
 
-    extern __shared__ uint8_t s_bins[];  // unused when USE_CACHE == false
+    // Dynamic SMEM caches the at-threshold-bin element indices written
+    // during Pass 2, so Stage-2 only iterates that subset.
+    extern __shared__ int s_at_threshold_idx[];
 
     auto& hist = hist_buf[0];
     const int tx = threadIdx.x;
@@ -395,16 +407,14 @@ __device__ void approx_topk_remap_inner(
     };
 
     if (tx < RADIX + 1) hist[tx] = 0;
+    if (tx == 0) s_at_threshold_count = 0;
     __syncthreads();
 
-    // Stage-1 Pass 1: read raw, apply transform once, cache the byte-0
-    // bin in s_bins so subsequent passes can gate without re-touching
-    // global memory or re-applying the transform.
+    // Stage-1 Pass 1: byte-0 histogram.
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
         const float raw    = to_float<ScoreT>(input[idx]);
         const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
         const auto  bin    = (score_to_key32(mapped) >> 24) & 0xFFu;
-        if constexpr (USE_CACHE) s_bins[idx] = static_cast<uint8_t>(bin);
         ::atomicAdd(&hist[bin], 1);
     }
     __syncthreads();
@@ -422,20 +432,11 @@ __device__ void approx_topk_remap_inner(
     const int last_remain0 = s_last_remain;
 
     if (last_remain0 <= tolerate_thresh) {
-        // Early-termination path: above-threshold pages are already
-        // selected from the histogram; sample the remaining `last_remain0`
-        // from the threshold bin via a single decrement counter. Only the
-        // bin gate is needed here, so USE_CACHE skips the re-read entirely
-        // for non-threshold elements.
+        // Early-termination: 1 pass over length, no Stage-2 refinement.
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-            int bin;
-            if constexpr (USE_CACHE) {
-                bin = static_cast<int>(s_bins[idx]);
-            } else {
-                const float raw    = to_float<ScoreT>(input[idx]);
-                const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
-                bin = static_cast<int>((score_to_key32(mapped) >> 24) & 0xFFu);
-            }
+            const float raw    = to_float<ScoreT>(input[idx]);
+            const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
+            const int   bin    = static_cast<int>((score_to_key32(mapped) >> 24) & 0xFFu);
             if (bin > tbin0) {
                 const int pos = ::atomicAdd(&s_counter, 1);
                 index[pos] = idx;
@@ -453,33 +454,23 @@ __device__ void approx_topk_remap_inner(
     if (tx < RADIX + 1) hist[tx] = 0;
     __syncthreads();
 
-    // Stage-1 Pass 2 + Stage-2 sub-bin histogram. USE_CACHE reads bin0
-    // from s_bins; the uncached path computes key32 inline and reuses it
-    // for bin1 so the at-threshold branch costs exactly one transform
-    // apply (matching the original kernel's behavior).
+    // Stage-1 Pass 2: emit above-threshold pages, cache at-threshold
+    // indices in SMEM, build byte-1 sub-bin histogram for Stage-2.
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-        int bin0;
-        uint32_t key32 = 0;
-        if constexpr (USE_CACHE) {
-            bin0 = static_cast<int>(s_bins[idx]);
-        } else {
-            const float raw    = to_float<ScoreT>(input[idx]);
-            const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
-            key32 = score_to_key32(mapped);
-            bin0  = static_cast<int>((key32 >> 24) & 0xFFu);
-        }
-
+        const float raw    = to_float<ScoreT>(input[idx]);
+        const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
+        const uint32_t key32 = score_to_key32(mapped);
+        const int   bin0   = static_cast<int>((key32 >> 24) & 0xFFu);
         if (bin0 > tbin0) {
             const int pos = ::atomicAdd(&s_counter, 1);
             index[pos] = idx;
         } else if (bin0 == tbin0) {
-            if constexpr (USE_CACHE) {
-                const float raw    = to_float<ScoreT>(input[idx]);
-                const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
-                key32 = score_to_key32(mapped);
-            }
-            const auto bin1 = (key32 >> 16) & 0xFFu;
+            const int bin1 = static_cast<int>((key32 >> 16) & 0xFFu);
             ::atomicAdd(&hist[bin1], 1);
+            const int slot = ::atomicAdd(&s_at_threshold_count, 1);
+            if (slot < kApproxRemapSmemInputSize) {
+                s_at_threshold_idx[slot] = idx;
+            }
         }
     }
     __syncthreads();
@@ -492,35 +483,44 @@ __device__ void approx_topk_remap_inner(
     }
     __syncthreads();
 
-    const int tbin1 = s_threshold_bin;
+    const int tbin1     = s_threshold_bin;
+    const int at_thresh = s_at_threshold_count;
 
-    // Stage-2 refinement: cached gate; at-threshold path computes key32
-    // once and uses it directly for bin1.
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-        int bin0;
-        uint32_t key32 = 0;
-        if constexpr (USE_CACHE) {
-            bin0 = static_cast<int>(s_bins[idx]);
-        } else {
+    if (at_thresh <= kApproxRemapSmemInputSize) {
+        // Stage-2 fast: iterate only cached at-threshold indices.
+        for (int i = tx; i < at_thresh; i += BLOCK_SIZE) {
+            const int idx = s_at_threshold_idx[i];
             const float raw    = to_float<ScoreT>(input[idx]);
             const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
-            key32 = score_to_key32(mapped);
-            bin0  = static_cast<int>((key32 >> 24) & 0xFFu);
+            const int   bin1   = static_cast<int>((score_to_key32(mapped) >> 16) & 0xFFu);
+            if (bin1 > tbin1) {
+                const int pos = ::atomicAdd(&s_counter, 1);
+                index[pos] = idx;
+            } else if (bin1 == tbin1) {
+                const int pos = ::atomicAdd(&s_last_remain, -1);
+                if (pos > 0) {
+                    index[target_k - pos] = idx;
+                }
+            }
         }
-        if (bin0 != tbin0) continue;
-        if constexpr (USE_CACHE) {
+    } else {
+        // Overflow fallback: at-threshold count exceeded SMEM cache;
+        // re-iterate the full length (original Pass 3 behavior).
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
             const float raw    = to_float<ScoreT>(input[idx]);
             const float mapped = apply_transform_tmpl<MODE>(raw, mapping_power);
-            key32 = score_to_key32(mapped);
-        }
-        const auto bin1 = (key32 >> 16) & 0xFFu;
-        if (bin1 > tbin1) {
-            const int pos = ::atomicAdd(&s_counter, 1);
-            index[pos] = idx;
-        } else if (bin1 == tbin1) {
-            const int pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-                index[target_k - pos] = idx;
+            const uint32_t key32 = score_to_key32(mapped);
+            const int   bin0   = static_cast<int>((key32 >> 24) & 0xFFu);
+            if (bin0 != tbin0) continue;
+            const int   bin1   = static_cast<int>((key32 >> 16) & 0xFFu);
+            if (bin1 > tbin1) {
+                const int pos = ::atomicAdd(&s_counter, 1);
+                index[pos] = idx;
+            } else if (bin1 == tbin1) {
+                const int pos = ::atomicAdd(&s_last_remain, -1);
+                if (pos > 0) {
+                    index[target_k - pos] = idx;
+                }
             }
         }
     }
@@ -528,7 +528,7 @@ __device__ void approx_topk_remap_inner(
 }
 
 
-template <typename ScoreT, int MODE, bool USE_CACHE>
+template <typename ScoreT, int MODE>
 __global__ __launch_bounds__(kThreadsPerBlock)
 void ApproxTopKRemap_Kernel(
     const ScoreT* __restrict__ score,
@@ -563,7 +563,7 @@ void ApproxTopKRemap_Kernel(
 
     __shared__ int s_indices[VORTEX_MAX_TOPK];
 
-    approx_topk_remap_inner<ScoreT, MODE, USE_CACHE>(
+    approx_topk_remap_inner<ScoreT, MODE>(
         score_blk, s_indices, nblk, target_k, tolerate_thresh, mapping_power);
     __syncthreads();
 
@@ -649,39 +649,28 @@ void approx_topk_output_remap(
     dim3 nthreads(kThreadsPerBlock);
     const float tol = static_cast<float>(tolerate_ratio);
 
-    // s_bins occupies one byte per element. Round to 16 bytes for alignment.
-    const size_t bins_bytes = (static_cast<size_t>(max_num_pages) + size_t(15)) & ~size_t(15);
-    const bool   use_cache  = (bins_bytes <= kApproxRemapSmemMax);
-    const size_t launch_smem = use_cache ? bins_bytes : 0;
+    // Dynamic SMEM caches at-threshold-bin indices (kApproxRemapSmemInputSize
+    // ints = 16 KB). Stage-2 then iterates only that subset instead of the
+    // full row.
+    constexpr size_t kApproxRemapSmemBytes =
+        static_cast<size_t>(kApproxRemapSmemInputSize) * sizeof(int);
+    static_assert(kApproxRemapSmemBytes <= kApproxRemapSmemMax,
+                  "approx-remap SMEM cache exceeds opt-in ceiling");
 
     #define VORTEX_DISPATCH_SLOW(DTYPE, PTR_EXPR, MODE_VAL)                              \
         do {                                                                              \
-            if (use_cache) {                                                              \
-                approx_setup_kernel_smem_once<                                            \
-                    ApproxTopKRemap_Kernel<DTYPE, MODE_VAL, true>,                        \
-                    kApproxRemapSmemMax>();                                               \
-                ApproxTopKRemap_Kernel<DTYPE, MODE_VAL, true>                             \
-                    <<<nblks, nthreads, launch_smem, stream>>>(                           \
-                    PTR_EXPR,                                                             \
-                    dense_kv_indptr.data_ptr<int>(),                                      \
-                    sparse_kv_indptr.data_ptr<int>(),                                     \
-                    dense_kv_indices.data_ptr<int>(),                                     \
-                    sparse_kv_indices.data_ptr<int>(),                                    \
-                    static_cast<int>(reserved_bos),                                       \
-                    static_cast<int>(reserved_eos),                                       \
-                    tol, power_exp);                                                      \
-            } else {                                                                      \
-                ApproxTopKRemap_Kernel<DTYPE, MODE_VAL, false>                            \
-                    <<<nblks, nthreads, 0, stream>>>(                                     \
-                    PTR_EXPR,                                                             \
-                    dense_kv_indptr.data_ptr<int>(),                                      \
-                    sparse_kv_indptr.data_ptr<int>(),                                     \
-                    dense_kv_indices.data_ptr<int>(),                                     \
-                    sparse_kv_indices.data_ptr<int>(),                                    \
-                    static_cast<int>(reserved_bos),                                       \
-                    static_cast<int>(reserved_eos),                                       \
-                    tol, power_exp);                                                      \
-            }                                                                             \
+            approx_setup_kernel_smem_once<                                                \
+                ApproxTopKRemap_Kernel<DTYPE, MODE_VAL>, kApproxRemapSmemMax>();          \
+            ApproxTopKRemap_Kernel<DTYPE, MODE_VAL>                                       \
+                <<<nblks, nthreads, kApproxRemapSmemBytes, stream>>>(                     \
+                PTR_EXPR,                                                                 \
+                dense_kv_indptr.data_ptr<int>(),                                          \
+                sparse_kv_indptr.data_ptr<int>(),                                         \
+                dense_kv_indices.data_ptr<int>(),                                         \
+                sparse_kv_indices.data_ptr<int>(),                                        \
+                static_cast<int>(reserved_bos),                                           \
+                static_cast<int>(reserved_eos),                                           \
+                tol, power_exp);                                                          \
         } while (0)
 
     #define VORTEX_DISPATCH_MODE(DTYPE, PTR_EXPR)                                         \

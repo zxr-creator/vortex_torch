@@ -173,6 +173,27 @@ cudaStream_t        stream)
 }
 
 
+// `TopKOutput_Kernel` is a single-block in-register cub::BlockRadixSort.
+// Its capacity is exactly NUM_THREADS * ITEM_PER_THREAD elements per row,
+// and the dispatcher tops out at (256, 16) = 4096. For rows longer than
+// that, cub::BlockLoad reads only the first 4096 entries; the remainder
+// is silently dropped (padded with -inf in the OOB tail). The output is
+// then "top-k of the first 4096 elements" — recall ≈ 4096 / length, so
+// for length=131072 we measured recall ≈ 0.033.
+//
+// Bumping NUM_THREADS / ITEM_PER_THREAD doesn't rescue this: each thread
+// holds ITEM_PER_THREAD × (key + raw_key + val) register slots, and at
+// (256, 16) we're already near the per-thread register ceiling. Pushing
+// to (256, 64) = 16384 is borderline; (256, 512) = 131072 would spill so
+// hard the kernel would be slower than full DRAM sort.
+//
+// The correct algorithm at long input is radix-select with bounded
+// refinement, which is exactly `topk_output_v2`. So when `max_num_pages`
+// exceeds the block-sort capacity, delegate to `topk_output_v2` to keep
+// `topk_output` correct over the whole input range. Short inputs still
+// take the fast register-sort path.
+constexpr int64_t kBlockSortMaxPages = 4096;
+
 void topk_output(
 const at::Tensor& x,
 const at::Tensor& dense_kv_indptr,
@@ -184,6 +205,13 @@ const int64_t     reserved_bos,
 const int64_t     reserved_eos,
 const int64_t     max_num_pages
 ){
+    if (max_num_pages > kBlockSortMaxPages) {
+        topk_output_v2(x, dense_kv_indptr, sparse_kv_indptr, dense_kv_indices,
+                       sparse_kv_indices, eff_batch_size,
+                       reserved_bos, reserved_eos, max_num_pages);
+        return;
+    }
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const auto dtype = x.scalar_type();
 

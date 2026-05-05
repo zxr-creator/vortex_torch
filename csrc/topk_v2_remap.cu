@@ -673,13 +673,17 @@ void topk_output_v2_remap(
     dim3 nblks(eff_batch_size);
     dim3 nthreads(kThreadsPerBlock);
 
-    // s_bins occupies one byte per element (max_num_pages elements). Round
-    // up to 16-byte alignment. Use the bin cache only when (kSmem + bins)
-    // fits within the device-opt-in SMEM ceiling; otherwise fall back to
-    // the original kernel which re-reads on every pass.
+    // s_bins (uint8 per element) was an attempt to cache the Stage-1 bin
+    // so Pass 2 could skip the global re-read + transform re-apply. On
+    // bf16 inputs with already-coalesced global reads, the uint8 SMEM
+    // path adds 4-way bank conflicts that erase the savings on cheap
+    // mappings. We keep the templated kernel for future archs with
+    // wider SMEM banks but disable the cache path here. Flip
+    // `use_cache` back to the size check to re-enable it.
     const size_t bins_bytes = (static_cast<size_t>(max_num_pages) + 15) & ~size_t(15);
-    const bool   use_cache  = (kSmem + bins_bytes <= kSmemMax);
-    const size_t launch_smem = use_cache ? (kSmem + bins_bytes) : kSmem;
+    (void)bins_bytes;
+    const bool   use_cache  = false;
+    const size_t launch_smem = kSmem;
 
     #define VORTEX_DISPATCH_SLOW(DTYPE, PTR_EXPR, MODE_VAL)                              \
         do {                                                                              \
