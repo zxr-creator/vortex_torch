@@ -167,10 +167,7 @@ cudaStream_t        stream)
     else if (max_num_pages <= 2560)    { LAUNCH_TOPK(256, 10); }
     else if (max_num_pages <= 3072)    { LAUNCH_TOPK(256, 12); }
     else if (max_num_pages <= 3584)    { LAUNCH_TOPK(256, 14); }
-    else if (max_num_pages <= 4096)    { LAUNCH_TOPK(256, 16); }
-    else {
-        TORCH_CHECK(false, "topk_output: max_num_pages > 4096 not supported");
-    }
+    else                               { LAUNCH_TOPK(256, 16); }
 
     #undef LAUNCH_TOPK
 }

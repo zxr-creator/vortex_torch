@@ -24,7 +24,13 @@ from vortex_torch_C import (
     topk_output,
     topk_output_v2,
     approx_topk_output,
+    topk_output_sglang_ori,
 )
+
+# sglang_topk.cu hard-codes TopK at compile time. The current build sets it to
+# this value; configs whose topk_val != SGLANG_ORI_TOPK are skipped for that
+# kernel. Bumping this means rebuilding sglang_topk.cu.
+SGLANG_ORI_TOPK = 32
 
 EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16",
                         choices=["bfloat16", "float16", "float32"],
                         help="Score tensor dtype (default: bfloat16, matches Q/K dtype).")
+    parser.add_argument("--distribution", default="normal",
+                        choices=["uniform", "normal", "real", "bimodal"],
+                        help="Score-tensor distribution. 'real' is a lognormal proxy for "
+                             "post-softmax attention scores; 'bimodal' is a sparse-spike "
+                             "mixture (95%% low-noise + 5%% high-spike).")
     parser.add_argument("--num-warmup", type=int, default=20)
     parser.add_argument("--num-iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
@@ -61,6 +72,29 @@ def parse_args() -> argparse.Namespace:
                         help="Append one JSON record per measurement to this path.")
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
+
+
+def make_scores(distribution: str, shape, dtype: torch.dtype, device: str) -> torch.Tensor:
+    """Allocate the score tensor used by the top-k kernels under one of four distributions.
+
+    Sampling is done in float32 for numerical stability, then cast to `dtype`.
+    """
+    if distribution == "uniform":
+        x = torch.rand(shape, device=device, dtype=torch.float32).mul_(2.0).sub_(1.0)
+    elif distribution == "normal":
+        x = torch.randn(shape, device=device, dtype=torch.float32)
+    elif distribution == "real":
+        # Lognormal — heavy-tailed proxy for post-softmax attention block scores.
+        x = torch.randn(shape, device=device, dtype=torch.float32).exp_()
+    elif distribution == "bimodal":
+        # 95% low-noise background + 5% high-spike component.
+        bg = torch.randn(shape, device=device, dtype=torch.float32).mul_(0.1)
+        spike = torch.randn(shape, device=device, dtype=torch.float32).mul_(0.5).add_(5.0)
+        mask = torch.rand(shape, device=device, dtype=torch.float32) < 0.05
+        x = torch.where(mask, spike, bg)
+    else:
+        raise ValueError(f"unknown distribution: {distribution!r}")
+    return x.to(dtype)
 
 
 def time_kernel(fn: Callable[[], None], num_warmup: int, num_iters: int) -> Dict[str, float]:
@@ -107,7 +141,7 @@ def main() -> None:
              "float32":  torch.float32}[args.dtype]
 
     # ----- Build the inputs that are constant across the topk_val sweep -----
-    x = torch.randn((total_dense_blocks, 1, 1), dtype=dtype, device=args.device)
+    x = make_scores(args.distribution, (total_dense_blocks, 1, 1), dtype, args.device)
     dense_kv_indptr = (
         torch.arange(eff_batch_size + 1, dtype=torch.int32, device=args.device)
         * blocks_per_row
@@ -143,6 +177,20 @@ def main() -> None:
             ("topk_output",    lambda: topk_output(*common_args),    None),
             ("topk_output_v2", lambda: topk_output_v2(*common_args), None),
         ]
+        if topk_val == SGLANG_ORI_TOPK:
+            sglang_indices_out = torch.zeros(
+                (eff_batch_size, topk_val), dtype=torch.int32, device=args.device,
+            )
+            sglang_args = (
+                x, dense_kv_indptr, sglang_indices_out,
+                eff_batch_size, topk_val,
+                args.reserved_bos, args.reserved_eos, blocks_per_row,
+            )
+            kernels.append((
+                "topk_output_sglang_ori",
+                lambda: topk_output_sglang_ori(*sglang_args),
+                None,
+            ))
         for tr in tolerate_ratios:
             tr_local = tr  # capture for closure
             kernels.append((
@@ -152,7 +200,15 @@ def main() -> None:
             ))
 
         for kernel_name, fn, tr in kernels:
-            stats = time_kernel(fn, args.num_warmup, args.num_iters)
+            try:
+                stats = time_kernel(fn, args.num_warmup, args.num_iters)
+            except RuntimeError as e:
+                print(
+                    f"[{model_label}|bs={args.batch_size}|in={input_label}|"
+                    f"topk={topk_val}|dist={args.distribution}|{kernel_name}] "
+                    f"SKIPPED: {e}"
+                )
+                continue
             record = {
                 "model": model_label,
                 "model_name": args.model_name,
@@ -172,6 +228,7 @@ def main() -> None:
                 "kernel": kernel_name,
                 "tolerate_ratio": tr,
                 "dtype": args.dtype,
+                "distribution": args.distribution,
                 "num_warmup": args.num_warmup,
                 "num_iters": args.num_iters,
                 **stats,
@@ -179,7 +236,7 @@ def main() -> None:
             records.append(record)
             print(
                 f"[{model_label}|bs={args.batch_size}|in={input_label}|"
-                f"topk={topk_val}|{kernel_name}] "
+                f"topk={topk_val}|dist={args.distribution}|{kernel_name}] "
                 f"mean={stats['mean_ms']:.4f}ms  p50={stats['p50_ms']:.4f}ms  "
                 f"p95={stats['p95_ms']:.4f}ms  min={stats['min_ms']:.4f}ms"
             )

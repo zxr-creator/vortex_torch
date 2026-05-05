@@ -11,6 +11,7 @@ PYBIND11_MODULE(vortex_torch_C, m){
         m.def("topk_output",                    &topk_output);
         m.def("topk_output_v2",                 &topk_output_v2);
         m.def("approx_topk_output",             &approx_topk_output);
+        m.def("topk_output_sglang_ori",         &topk_output_sglang_ori);
         m.def("sglang_plan_decode_fa3",         &sglang_plan_decode_fa3);
         m.def("sglang_plan_prefill_fa3",        &sglang_plan_prefill_fa3);
         m.def("Chunkwise_HN2NH_Transpose_FA3",  &Chunkwise_HN2NH_Transpose_FA3);

@@ -109,6 +109,17 @@ const int64_t       max_seq_lengths,
 const double        tolerate_ratio
 );
 
+void topk_output_sglang_ori(
+const at::Tensor&   x,
+const at::Tensor&   dense_kv_indptr,
+at::Tensor&         indices_out,
+const int64_t       eff_batch_size,
+const int64_t       topk_val,
+const int64_t       reserved_bos,
+const int64_t       reserved_eos,
+const int64_t       max_num_pages
+);
+
 void sglang_plan_decode_fa3(
 const at::Tensor&   cached_seq_lens,
 at::Tensor&         dense_kv_indptr,

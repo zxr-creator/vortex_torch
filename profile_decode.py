@@ -109,12 +109,6 @@ def main() -> None:
 
     parser.add_argument("--vortex-algorithm", default="BLOCK_TOPK")
     parser.add_argument(
-        "--vortex-module-name",
-        default="block_sparse_attention",
-        help="Registered vortex flow module name (e.g. block_sparse_attention, "
-             "gqa_quest_sparse_attention).",
-    )
-    parser.add_argument(
         "--no-vortex",
         action="store_true",
         help="Force full FlashInfer attention path (debug only). "

@@ -28,7 +28,7 @@ fi
 # Test matrix
 MODEL_PATHS=(Qwen/Qwen3-0.6B Qwen/Qwen3-1.7B Qwen/Qwen3-4B Qwen/Qwen3-8B)
 MODEL_LABELS=(qwen3_0p6b qwen3_1p7b qwen3_4b qwen3_8b)
-BATCH_SIZES=(1 2 4 8 16)
+BATCH_SIZES=(4 16)
 INPUT_LENS=(4096 8192 16384 32768)
 INPUT_LABELS=(4k 8k 16k 32k)
 # Sparse-attention flow names (vortex_module_name) to sweep.
