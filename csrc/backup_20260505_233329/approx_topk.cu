@@ -359,24 +359,12 @@ __device__ __forceinline__ uint32_t score_to_key32(float x) {
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-// FP16-based 8-bit bucket — matches `convert_to_uint8` in topk_v2.cu so
-// Pass 1's coarse histogram has the same resolution as v2's. Crucial on
-// uniform-in-bf16 inputs where FP32 byte-3 has poor discrimination
-// (many values share the same exponent prefix and pile into one bin).
-__device__ __forceinline__ uint8_t convert_to_uint8_fp16(float x) {
-    __half h = __float2half_rn(x);
-    uint16_t bits = __half_as_ushort(h);
-    uint16_t key  = (bits & 0x8000)
-                  ? static_cast<uint16_t>(~bits)
-                  : static_cast<uint16_t>(bits | 0x8000);
-    return static_cast<uint8_t>(key >> 8);
-}
 
-
-// Total dynamic-SMEM ints across the two ping-pong at-threshold buffers.
-// The Stage-2 refinement reads from one buffer and writes survivors into
-// the other. Per-buffer capacity is SMEM_INPUT_SIZE = kApproxSmemInputSize / 2.
-// 16384 ints = 64 KB total — same shape as topk_v2's vh_input_idx[2][8192].
+// At-threshold-bin index cache size for the slow-path Stage-2 refinement.
+// Sized to comfortably hold the threshold bin even for skewed distributions
+// (bimodal, uniform-in-bf16) at length=131072 — empirically the threshold
+// bin grows up to ~10k elements there. 16384 ints = 64 KB SMEM, which
+// fits inside the per-block opt-in ceiling on every supported arch.
 // Must equal kApproxRemapSmemInputSize (see approx_topk_remap.cu).
 constexpr int kApproxSmemInputSize = 16384;
 
@@ -393,14 +381,6 @@ void approx_setup_kernel_smem_once_local() {
 constexpr size_t kApproxSmemMax = 80 * 1024;   // RTX PRO 6000 (Blackwell SM_120)
 // constexpr size_t kApproxSmemMax = 64 * 1024;   // H100 / H200 (Hopper SM_90) — uncomment on H200 if 80 KB triggers `cudaFuncSetAttribute: invalid argument`. 64 KB matches launch usage and always validates.
 
-// `approx_topk_inner` — direct port of `fast_topk_vortex` from topk_v2.cu
-// (Stage-1 byte-0 hist + cached at-threshold cache + 4-round byte-1..byte-0
-// FP32 refinement) with one apx-only addition: an α-fast-path early-return
-// after Pass 1's threshold detection. When `last_remain <= tolerate_thresh`
-// the kernel emits the residual stochastically in one length-pass instead
-// of running Stage-2; otherwise it runs the same exact slow-path as v2,
-// dropping overflow at-threshold elements past SMEM_INPUT_SIZE just like
-// v2 does (recall ceiling = bf16-tie ceiling ≈ 0.99).
 template <typename ScoreT>
 __device__ void approx_topk_inner(
     const ScoreT* __restrict__ input,
@@ -409,74 +389,74 @@ __device__ void approx_topk_inner(
     const int     target_k,
     const int     tolerate_thresh)
 {
-    int topk = target_k;
     constexpr int BLOCK_SIZE = kThreadsPerBlock;
-    // Per-ping-pong-buffer capacity = total dynamic SMEM / 2 buffers / 4 B.
-    constexpr int SMEM_INPUT_SIZE = kApproxSmemInputSize / 2;
 
-    alignas(128) __shared__ int vh_histogram_buf[2][RADIX + 128];
-    alignas(128) __shared__ int vh_counter;
-    alignas(128) __shared__ int vh_threshold_bin_id;
-    alignas(128) __shared__ int vh_num_input[2];
-    alignas(128) __shared__ int vh_last_remain_fast;  // for α-fast-path
+    alignas(128) __shared__ int hist_buf[2][RADIX + 128];
+    alignas(128) __shared__ int s_threshold_bin;
+    alignas(128) __shared__ int s_counter;        // strict-winner write head
+    alignas(128) __shared__ int s_last_remain;    // atomic-arrival countdown
+    alignas(128) __shared__ int s_at_threshold_count;
 
-    auto& vh_histogram = vh_histogram_buf[0];
-    extern __shared__ int vh_input_idx[][SMEM_INPUT_SIZE];
+    extern __shared__ int s_at_threshold_idx[];   // [kApproxSmemInputSize]
 
+    auto& hist = hist_buf[0];
     const int tx = threadIdx.x;
 
+    // Reverse inclusive cumulative sum; final result lands in hist_buf[0].
     auto run_cumsum = [&] {
         #pragma unroll 8
         for (int i = 0; i < 8; ++i) {
-            static_assert(1 << 8 == RADIX);
             if (C10_LIKELY(tx < RADIX)) {
-                const auto j = 1 << i;
-                const auto k = i & 1;
-                auto value = vh_histogram_buf[k][tx];
-                if (tx < RADIX - j) {
-                    value += vh_histogram_buf[k][tx + j];
-                }
-                vh_histogram_buf[k ^ 1][tx] = value;
+                const int j = 1 << i;
+                const int k = i & 1;
+                int v = hist_buf[k][tx];
+                if (tx < RADIX - j) v += hist_buf[k][tx + j];
+                hist_buf[k ^ 1][tx] = v;
             }
             __syncthreads();
         }
     };
 
-    // Stage 1 Pass 1: 8-bit FP16-coarse histogram.
-    if (tx < RADIX + 1) vh_histogram[tx] = 0;
+    // ---------------- Pass 1: histogram on byte 0 ----------------
+    if (tx < RADIX + 1) hist[tx] = 0;
+    if (tx == 0) s_at_threshold_count = 0;
     __syncthreads();
 
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-        const auto bin = convert_to_uint8_fp16(to_float<ScoreT>(input[idx]));
-        ::atomicAdd(&vh_histogram[bin], 1);
+        const auto bin =
+            (score_to_key32(to_float<ScoreT>(input[idx])) >> 24) & 0xFFu;
+        ::atomicAdd(&hist[bin], 1);
     }
     __syncthreads();
 
     run_cumsum();
-    if (tx < RADIX && vh_histogram[tx] > topk && vh_histogram[tx + 1] <= topk) {
-        vh_threshold_bin_id  = tx;
-        vh_num_input[0]      = 0;
-        vh_counter           = 0;
-        vh_last_remain_fast  = topk - vh_histogram[tx + 1];
+
+    if (tx < RADIX && hist[tx] > target_k && hist[tx + 1] <= target_k) {
+        s_threshold_bin = tx;
+        s_counter       = 0;
+        s_last_remain   = target_k - hist[tx + 1];
     }
     __syncthreads();
 
-    const auto tbin0           = vh_threshold_bin_id;
-    const auto last_remain0    = vh_last_remain_fast;
+    const int tbin0        = s_threshold_bin;
+    const int last_remain0 = s_last_remain;
 
-    // ---------------- α-fast-path early return (apx-only) ----------------
-    // When the residual to fill from the threshold bin fits within the
-    // user-specified tolerance, emit deterministic above-threshold + a
-    // stochastic sample of `last_remain` from the threshold bin in one
-    // length-pass. No Stage-2 refinement needed.
+    // ---------------- Single-pass emit ----------------
+    // Fast path fires only when the user explicitly opts in via tolerate_thresh.
+    // No degenerate-bin auto-fallback: at α=0 we always run the exact
+    // slow-path refinement, even on degenerate distributions where the
+    // threshold bin overflows the SMEM cache (Pass 3 then re-iterates the
+    // full row to pick up overflow elements). Trading latency for recall
+    // here keeps `approx_topk@0` an honest baseline.
     if (last_remain0 <= tolerate_thresh) {
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-            const auto bin = convert_to_uint8_fp16(to_float<ScoreT>(input[idx]));
+            const auto bin =
+                (score_to_key32(to_float<ScoreT>(input[idx])) >> 24) & 0xFFu;
             if (bin > tbin0) {
-                const int pos = ::atomicAdd(&vh_counter, 1);
+                const int pos = ::atomicAdd(&s_counter, 1);
                 index[pos] = idx;
             } else if (bin == tbin0) {
-                const int pos = ::atomicAdd(&vh_last_remain_fast, -1);
+                const int pos = ::atomicAdd(&s_last_remain, -1);
                 if (pos > 0) {
                     index[target_k - pos] = idx;
                 }
@@ -486,113 +466,77 @@ __device__ void approx_topk_inner(
         return;
     }
 
-    topk -= vh_histogram[tbin0 + 1];
+    // ---------------- Pass 2: emit byte-0 strict + byte-1 sub-histogram ----------------
+    // Cache at-threshold-bin indices in dynamic SMEM so Pass 3 only iterates
+    // that subset (typically O(length/256)) instead of the full row again.
+    if (tx < RADIX + 1) hist[tx] = 0;
+    __syncthreads();
 
-    // Stage 1 Pass 2: emit byte-0 strict winners + cache at-threshold idx +
-    // build byte-3 (top byte of FP32 key) sub-histogram for Stage-2 round 0.
-    if (topk == 0) {
-        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-            const auto bin = static_cast<int>(
-                convert_to_uint8_fp16(to_float<ScoreT>(input[idx])));
-            if (bin > tbin0) {
-                const auto pos = ::atomicAdd(&vh_counter, 1);
-                index[pos] = idx;
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+        const auto key32 = score_to_key32(to_float<ScoreT>(input[idx]));
+        const auto bin0  = (key32 >> 24) & 0xFFu;
+        if (bin0 > tbin0) {
+            const int pos = ::atomicAdd(&s_counter, 1);
+            index[pos] = idx;
+        } else if (bin0 == tbin0) {
+            const auto bin1 = (key32 >> 16) & 0xFFu;
+            ::atomicAdd(&hist[bin1], 1);
+            const int slot = ::atomicAdd(&s_at_threshold_count, 1);
+            if (slot < kApproxSmemInputSize) {
+                s_at_threshold_idx[slot] = idx;
             }
         }
-        __syncthreads();
-        return;
+    }
+    __syncthreads();
+
+    run_cumsum();
+
+    // Find byte-1 threshold bin against the new top-k = last_remain0.
+    if (tx < RADIX && hist[tx] > last_remain0 && hist[tx + 1] <= last_remain0) {
+        s_threshold_bin = tx;
+        s_last_remain   = last_remain0 - hist[tx + 1];
+    }
+    __syncthreads();
+
+    const int tbin1     = s_threshold_bin;
+    const int at_thresh = s_at_threshold_count;
+
+    if (at_thresh <= kApproxSmemInputSize) {
+        // ---------------- Pass 3: only iterate cached at-threshold subset ----------------
+        for (int i = tx; i < at_thresh; i += BLOCK_SIZE) {
+            const int idx = s_at_threshold_idx[i];
+            const auto key32 = score_to_key32(to_float<ScoreT>(input[idx]));
+            const auto bin1 = (key32 >> 16) & 0xFFu;
+            if (bin1 > tbin1) {
+                const int pos = ::atomicAdd(&s_counter, 1);
+                index[pos] = idx;
+            } else if (bin1 == tbin1) {
+                const int pos = ::atomicAdd(&s_last_remain, -1);
+                if (pos > 0) {
+                    index[target_k - pos] = idx;
+                }
+            }
+        }
     } else {
-        __syncthreads();
-        if (tx < RADIX + 1) vh_histogram[tx] = 0;
-        __syncthreads();
-
+        // Overflow: at-threshold-bin count exceeded SMEM cache; re-iterate
+        // the full length (original Pass 3 behavior).
         for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-            const auto raw_input = to_float<ScoreT>(input[idx]);
-            const auto bin = static_cast<int>(convert_to_uint8_fp16(raw_input));
-            if (bin > tbin0) {
-                const auto pos = ::atomicAdd(&vh_counter, 1);
+            const auto key32 = score_to_key32(to_float<ScoreT>(input[idx]));
+            const auto bin0  = (key32 >> 24) & 0xFFu;
+            if (bin0 != tbin0) continue;
+            const auto bin1 = (key32 >> 16) & 0xFFu;
+            if (bin1 > tbin1) {
+                const int pos = ::atomicAdd(&s_counter, 1);
                 index[pos] = idx;
-            } else if (bin == tbin0) {
-                const auto pos = ::atomicAdd(&vh_num_input[0], 1);
-                if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-                    vh_input_idx[0][pos] = idx;
-                    const auto b32 = score_to_key32(raw_input);
-                    const auto sub_bin = (b32 >> 24) & 0xFF;
-                    ::atomicAdd(&vh_histogram[sub_bin], 1);
+            } else if (bin1 == tbin1) {
+                const int pos = ::atomicAdd(&s_last_remain, -1);
+                if (pos > 0) {
+                    index[target_k - pos] = idx;
                 }
             }
-        }
-        __syncthreads();
-    }
-
-    // Stage 2: 4-round byte-3..byte-0 FP32 radix refinement on the cached
-    // at-threshold subset. Round 3 emits residual via atomic-arrival.
-    #pragma unroll 4
-    for (int round = 0; round < 4; ++round) {
-        __shared__ int vh_last_remain;
-        const auto r_idx = round % 2;
-
-        const auto _raw_num_input = vh_num_input[r_idx];
-        const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE))
-                                    ? _raw_num_input
-                                    : int(SMEM_INPUT_SIZE);
-
-        run_cumsum();
-        if (tx < RADIX && vh_histogram[tx] > topk && vh_histogram[tx + 1] <= topk) {
-            vh_threshold_bin_id    = tx;
-            vh_num_input[r_idx ^ 1] = 0;
-            vh_last_remain          = topk - vh_histogram[tx + 1];
-        }
-        __syncthreads();
-
-        const auto threshold_bin = vh_threshold_bin_id;
-        topk -= vh_histogram[threshold_bin + 1];
-
-        if (topk == 0) {
-            for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-                const auto idx = vh_input_idx[r_idx][i];
-                const auto offset = 24 - round * 8;
-                const auto bin = (score_to_key32(
-                    to_float<ScoreT>(input[idx])) >> offset) & 0xFF;
-                if (bin > threshold_bin) {
-                    const auto pos = ::atomicAdd(&vh_counter, 1);
-                    index[pos] = idx;
-                }
-            }
-            __syncthreads();
-            break;
-        } else {
-            __syncthreads();
-            if (tx < RADIX + 1) vh_histogram[tx] = 0;
-            __syncthreads();
-            for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-                const auto idx = vh_input_idx[r_idx][i];
-                const auto raw_input = to_float<ScoreT>(input[idx]);
-                const auto offset = 24 - round * 8;
-                const auto bin = (score_to_key32(raw_input) >> offset) & 0xFF;
-                if (bin > threshold_bin) {
-                    const auto pos = ::atomicAdd(&vh_counter, 1);
-                    index[pos] = idx;
-                } else if (bin == threshold_bin) {
-                    if (round == 3) {
-                        const auto pos = ::atomicAdd(&vh_last_remain, -1);
-                        if (pos > 0) {
-                            index[target_k - pos] = idx;
-                        }
-                    } else {
-                        const auto pos = ::atomicAdd(&vh_num_input[r_idx ^ 1], 1);
-                        if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-                            vh_input_idx[r_idx ^ 1][pos] = idx;
-                            const auto b32 = score_to_key32(raw_input);
-                            const auto sub_bin = (b32 >> (offset - 8)) & 0xFF;
-                            ::atomicAdd(&vh_histogram[sub_bin], 1);
-                        }
-                    }
-                }
-            }
-            __syncthreads();
         }
     }
+    __syncthreads();
 }
 
 
